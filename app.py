@@ -5,7 +5,6 @@ from anthropic import Anthropic
 from PIL import Image, ImageEnhance, ImageOps
 import google.generativeai as genai
 import numpy as np
-import cv2
 import io
 import zipfile
 import logging
