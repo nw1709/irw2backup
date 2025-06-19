@@ -4,6 +4,7 @@ from PIL import Image
 import google.generativeai as genai
 import logging
 import hashlib
+import json
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -48,7 +49,7 @@ genai.configure(api_key=st.secrets["gemini_key"])
 vision_model = genai.GenerativeModel("gemini-1.5-flash")
 
 # --- OCR mit Caching ---
-@st.cache_data(ttl=3600)  # Cache für 1 Stunde
+@st.cache_data(ttl=3600)
 def extract_text_with_gemini(_image, file_hash):
     """Extrahiert Text aus Bild - gecached basierend auf file_hash"""
     try:
@@ -69,8 +70,49 @@ def extract_text_with_gemini(_image, file_hash):
         logger.error(f"Gemini OCR Error: {str(e)}")
         raise e
 
+# --- NEUE FUNKTION: Doppelte Verifizierung ---
+def verify_solution(ocr_text, first_solution):
+    """Verifiziert die erste Lösung durch eine zweite, unabhängige Analyse"""
+    verify_prompt = f"""Du bist ein ZWEITER Experte der die Lösung eines Kollegen überprüft.
+
+AUFGABENTEXT:
+{ocr_text}
+
+ERSTE LÖSUNG:
+{first_solution}
+
+DEINE AUFGABE:
+1. Löse die Aufgabe KOMPLETT NEU und UNABHÄNGIG
+2. Vergleiche deine Lösung mit der ersten Lösung
+3. Bei Unstimmigkeiten: Erkläre genau wo der Fehler liegt
+
+WICHTIGE PRÜFPUNKTE:
+- Bei Homogenität: Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
+- Wenn nur α + β gegeben ist (nicht α = β), ist die Funktion i.A. NICHT homogen
+- Prüfe JEDE mathematische Schlussfolgerung kritisch
+- Hinterfrage Annahmen die nicht explizit gegeben sind
+
+Antworte im Format:
+VERIFIKATION: [BESTÄTIGT/FEHLER GEFUNDEN]
+KORREKTE LÖSUNG: [Aufgabe X: Antwort]
+ERKLÄRUNG: [Warum die Lösung richtig/falsch ist]"""
+
+    client = Anthropic(api_key=st.secrets["claude_key"])
+    response = client.messages.create(
+        model="claude-4-opus-20250514",
+        max_tokens=2000,
+        temperature=0.3,  # Etwas höher für kritisches Denken
+        messages=[{"role": "user", "content": verify_prompt}]
+    )
+    
+    return response.content[0].text
+
 # --- UI Optionen ---
-debug_mode = st.checkbox("🔍 Debug-Modus", value=False, help="Zeigt OCR-Ergebnis und Details")
+col1, col2 = st.columns([1, 1])
+with col1:
+    debug_mode = st.checkbox("🔍 Debug-Modus", value=False)
+with col2:
+    double_check = st.checkbox("✅ Doppelte Verifizierung", value=True, help="Empfohlen für maximale Genauigkeit")
 
 # --- Datei-Upload ---
 uploaded_file = st.file_uploader(
@@ -97,111 +139,89 @@ if uploaded_file is not None:
         if debug_mode:
             with st.expander("🔍 OCR-Ergebnis", expanded=False):
                 st.code(ocr_text)
-                st.info(f"File Hash: {file_hash[:8]}... (für Caching)")
         
-        # Button zum Lösen - KEINE Caching für Lösungen!
+        # Button zum Lösen
         if st.button("🧮 Aufgaben lösen", type="primary"):
             
-            # Verbesserter Prompt mit Chain-of-Thought
-            prompt = f"""You are a highly qualified accounting expert with PhD-level 
-knowledge of the university course "Internes Rechnungswesen (31031)" at Fernuniversität Hagen. 
-Your task is to answer exam questions with 100% accuracy.
+            # NEUER PROMPT mit expliziten Fallstricken
+            prompt = f"""You are an expert in "Internes Rechnungswesen (31031)" at Fernuniversität Hagen.
 
-THEORETICAL SCOPE
-Use only the decision-oriented German managerial-accounting (Controlling) framework:
-• Cost-type, cost-center and cost-unit accounting (Kostenarten-, Kostenstellen-, Kostenträgerrechnung)
-• Full, variable, marginal, standard (Plankosten-) and process/ABC costing systems
-• Flexible and Grenzplankostenrechnung variance analysis
-• Single- and multi-level contribution-margin accounting and break-even logic
-• Causality & allocation (Verursachungs- und Zurechnungsprinzip)
-• Business-economics MRS convention (MRS = MP₂ / MP₁ unless stated otherwise)
-• Activity-analysis production & logistics models (LP, Standort- & Transportprobleme)
-• Marketing segmentation, price-elasticity, contribution-based pricing & mix planning
+MATHEMATICAL RIGOR RULES:
+1. A function is homogeneous of degree k if f(λr) = λ^k·f(r) for ALL λ and ALL valid inputs
+2. For f(r₁,r₂) = (r₁^α + r₂^β)^γ to be homogeneous, you MUST be able to factor out λ completely
+3. This is ONLY possible if α = β. If α ≠ β, the function is NOT homogeneous
+4. NEVER assume α = β unless explicitly stated
+5. "α + β = 3" does NOT imply α = β
 
-OCR-TEXT START:
+ANALYZE THIS TEXT:
 {ocr_text}
-OCR-TEXT ENDE
 
-CRITICAL THINKING PROCESS:
-1. Read the question COMPLETELY before making any assumptions
-2. Identify what is GIVEN and what is ASKED
-3. Check if all necessary conditions are met before drawing conclusions
-4. For each answer option: Test it rigorously against the given conditions
-5. Never assume additional constraints that are not explicitly stated
-6. If a mathematical property requires specific conditions, verify they are met
+SYSTEMATIC APPROACH:
+Step 1: Identify what is GIVEN (write it down)
+Step 2: Identify what is ASKED (write it down)
+Step 3: Apply definitions RIGOROUSLY
+Step 4: Check each answer option against your analysis
+Step 5: Select ONLY options that are mathematically correct
 
-STEP-BY-STEP APPROACH:
-- First: State what you need to check
-- Second: Perform the analysis systematically
-- Third: Draw conclusions based ONLY on your analysis
-- Fourth: Verify your answer matches your reasoning
+Think step by step. Show your work. Question your assumptions.
 
 FORMAT:
-Aufgabe [Nr]: [Final answer only]
-Begründung: [Concise explanation in German with your reasoning]
-
-Remember: Logical rigor is paramount. Do not jump to conclusions."""
+Aufgabe [Nr]: [Answer]
+Begründung: [Explanation in German]"""
             
-            if debug_mode:
-                with st.expander("🔍 Claude Prompt", expanded=False):
-                    st.code(prompt)
+            # Erste Lösung
+            with st.spinner("Löse Aufgabe (Schritt 1/2)..."):
+                client = Anthropic(api_key=st.secrets["claude_key"])
+                
+                response = client.messages.create(
+                    model="claude-4-opus-20250514",
+                    max_tokens=4000,
+                    temperature=0.2,
+                    top_p=0.95,
+                    system="You are a rigorous mathematician. Never make unjustified assumptions. If a property requires specific conditions, verify they are met.",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                
+                first_solution = response.content[0].text
             
-            # Claude API-Aufruf mit optimierten Parametern für besseres Reasoning
-            with st.spinner("Löse Aufgabe..."):
-                try:
-                    logger.info("Calling Claude API...")
-                    client = Anthropic(api_key=st.secrets["claude_key"])
+            # Doppelte Verifizierung wenn aktiviert
+            if double_check:
+                with st.spinner("Verifiziere Lösung (Schritt 2/2)..."):
+                    verification = verify_solution(ocr_text, first_solution)
                     
-                    # System Message für bessere Grundlogik
-                    system_message = """You are a precise academic expert. Always:
-1. Question your assumptions
-2. Check if conditions for mathematical properties are actually met
-3. Consider all possibilities before concluding
-4. Be especially careful with terms like 'homogeneous', 'linear', etc. - they have precise mathematical definitions
-5. If something is true only under specific conditions, those conditions must be verified"""
+                    if debug_mode:
+                        with st.expander("🔍 Verifizierungsergebnis"):
+                            st.code(verification)
                     
-                    response = client.messages.create(
-                        model="claude-4-opus-20250514",
-                        max_tokens=4000,
-                        temperature=0.1,      # Leicht erhöht für besseres Reasoning
-                        top_p=1.0,
-                        top_k=40,            # NEU: Begrenzt Auswahl für konsistenteres Reasoning
-                        system=system_message,  # NEU: System message für Grundlogik
-                        messages=[{
-                            "role": "user",
-                            "content": prompt
-                        }]
-                    )
-                    
-                    result = response.content[0].text
-                    logger.info("Claude API call successful")
-                    
-                except Exception as e:
-                    logger.error(f"Claude API Error: {str(e)}")
-                    st.error(f"API Fehler: {str(e)}")
-                    raise e
+                    # Finale Lösung basierend auf Verifizierung
+                    if "FEHLER GEFUNDEN" in verification:
+                        st.warning("⚠️ Inkonsistenz entdeckt - verwende verifizierte Lösung")
+                        # Extrahiere korrekte Lösung aus Verifizierung
+                        final_solution = verification
+                    else:
+                        final_solution = first_solution
+            else:
+                final_solution = first_solution
             
             # Ergebnisse anzeigen
             st.markdown("---")
             st.markdown("### Lösung:")
             
-            # Formatierte Ausgabe
-            lines = result.split('\n')
+            # Parse die finale Lösung
+            lines = final_solution.split('\n')
             for line in lines:
                 if line.strip():
-                    if line.startswith('Aufgabe'):
+                    if line.startswith('Aufgabe') or line.startswith('KORREKTE LÖSUNG:'):
                         parts = line.split(':', 1)
                         if len(parts) == 2:
                             st.markdown(f"### {parts[0]}: **{parts[1].strip()}**")
-                        else:
-                            st.markdown(f"### {line}")
-                    elif line.startswith('Begründung:'):
+                    elif line.startswith('Begründung:') or line.startswith('ERKLÄRUNG:'):
                         st.markdown(f"*{line}*")
-                    else:
-                        st.markdown(line)
-                        
-            # Info über Caching
-            st.info("💡 OCR-Ergebnisse werden gecached, Lösungen werden immer neu berechnet.")
+                    elif line.startswith('VERIFIKATION:'):
+                        if "BESTÄTIGT" in line:
+                            st.success("✅ Lösung wurde verifiziert")
+                        else:
+                            st.info("ℹ️ Lösung wurde korrigiert")
                     
     except Exception as e:
         logger.error(f"General error: {str(e)}")
@@ -209,4 +229,4 @@ Remember: Logical rigor is paramount. Do not jump to conclusions."""
 
 # --- Footer ---
 st.markdown("---")
-st.caption("Made by Fox | Enhanced reasoning with systematic thinking")
+st.caption("Made by Fox | Double-verification system for maximum accuracy")
