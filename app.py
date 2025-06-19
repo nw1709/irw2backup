@@ -6,6 +6,7 @@ import google.generativeai as genai
 import logging
 import hashlib
 import re
+import io
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 # --- UI-Einstellungen ---
 st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
 st.title("🦊 Koifox-Bot")
-st.markdown("*Multi-Model Consensus System*")
+st.markdown("*Multi-Model Consensus System mit optimierter OCR*")
 
 # --- API Key Validation ---
 def validate_keys():
@@ -67,29 +68,66 @@ def get_available_gpt_model():
 GPT_MODEL = get_available_gpt_model()
 st.sidebar.info(f"🤖 Verwende: Claude + {GPT_MODEL}")
 
-# --- GEMINI OCR FUNKTION ---
-@st.cache_data(ttl=3600)
-def extract_text_with_gemini(_image, file_hash):
-    """Extrahiert Text aus Bild mit Gemini"""
+# --- VERBESSERTE GEMINI OCR ---
+@st.cache_data(ttl=3600, show_spinner=False)
+def extract_text_with_gemini(_image_bytes, file_hash):
+    """Extrahiert KOMPLETTEN Text aus Bild mit Gemini"""
     try:
-        logger.info(f"Starting Gemini OCR for hash: {file_hash}")
+        logger.info(f"Starting Gemini OCR for hash: {file_hash[:8]}...")
         
-        # OCR mit Gemini
+        # Image aus bytes laden
+        image = Image.open(io.BytesIO(_image_bytes))
+        
+        # Bild nicht zu stark verkleinern für bessere OCR
+        max_size = 4096
+        if max(image.width, image.height) > max_size:
+            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        
+        # Verbesserter OCR Prompt
+        ocr_prompt = """
+        Extrahiere WIRKLICH ALLEN Text aus diesem Prüfungsbild:
+        
+        1. Beginne GANZ OBEN und lies bis GANZ UNTEN
+        2. Erfasse JEDE ZEILE Text
+        3. Inkludiere:
+           - Alle Aufgabennummern (z.B. "Aufgabe 45 (5 RP)")
+           - Komplette Aufgabentexte
+           - ALLE Formeln und mathematische Ausdrücke
+           - ALLE Antwortoptionen (A, B, C, D, E) mit vollem Text
+           - Alle Zahlen, Werte, Parameter
+        4. Behalte die exakte Formatierung bei
+        5. Überspringe NICHTS
+        6. Interpretiere oder löse NICHTS
+        
+        Gib den KOMPLETTEN Text wieder, vom ersten bis zum letzten Zeichen!
+        """
+        
+        # OCR mit höheren Limits
         response = vision_model.generate_content(
-            [
-                "Extract ALL text from this exam image EXACTLY as written. "
-                "Include all question numbers, text, formulas, and answer options (A, B, C, D, E). "
-                "Do NOT interpret or solve anything, just extract the text.",
-                _image
-            ],
+            [ocr_prompt, image],
             generation_config={
                 "temperature": 0,
-                "max_output_tokens": 8000
+                "top_p": 1,
+                "top_k": 1,
+                "max_output_tokens": 16384  # Maximale Token!
             }
         )
         
         ocr_text = response.text.strip()
         logger.info(f"Gemini OCR completed: {len(ocr_text)} characters")
+        
+        # Validierung
+        if len(ocr_text) < 500:
+            logger.warning(f"OCR möglicherweise unvollständig: nur {len(ocr_text)} Zeichen")
+            # Zweiter Versuch mit anderem Prompt
+            response2 = vision_model.generate_content(
+                ["Read and transcribe EVERY SINGLE word from this exam image. Start from the very top and continue to the very bottom. Include all text, numbers, formulas, and answer options.", image],
+                generation_config={"temperature": 0, "max_output_tokens": 16384}
+            )
+            if len(response2.text) > len(ocr_text):
+                ocr_text = response2.text.strip()
+                logger.info(f"Zweiter OCR-Versuch erfolgreicher: {len(ocr_text)} Zeichen")
+        
         return ocr_text
         
     except Exception as e:
@@ -100,13 +138,18 @@ def extract_text_with_gemini(_image, file_hash):
 def extract_answers(solution_text):
     """Extrahiert strukturierte Antworten aus Lösungstext"""
     answers = {}
-    lines = solution_text.split('\n')
     
-    for line in lines:
-        match = re.search(r'Aufgabe\s*(\d+)\s*:\s*([A-E,\s]+|\d+|[\d,]+)', line, re.IGNORECASE)
-        if match:
-            task_num = match.group(1)
-            answer = match.group(2).strip()
+    # Verschiedene Patterns probieren
+    patterns = [
+        r'Aufgabe\s*(\d+)\s*:\s*([A-E,\s]+|\d+[\d,\.]*)',
+        r'Task\s*(\d+)\s*:\s*([A-E,\s]+|\d+[\d,\.]*)',
+        r'(\d+)\.\s*([A-E,\s]+|\d+[\d,\.]*)'
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, solution_text, re.IGNORECASE | re.MULTILINE)
+        for task_num, answer in matches:
+            answer = answer.strip()
             if any(letter in answer.upper() for letter in 'ABCDE'):
                 answer = ''.join(sorted(c for c in answer.upper() if c in 'ABCDE'))
             answers[f"Aufgabe {task_num}"] = answer
@@ -123,17 +166,20 @@ KRITISCHE REGELN:
 - Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
 - Wenn nur α + β gegeben ist (ohne α = β), ist die Funktion NICHT homogen
 - Bei Multiple Choice: Prüfe JEDE Option einzeln
+- Beantworte ALLE Aufgaben die du im Text findest
 
 ANALYSIERE DIESEN TEXT:
 {ocr_text}
 
-FORMAT:
+FORMAT für JEDE gefundene Aufgabe:
 Aufgabe [Nr]: [Antwort]
-Begründung: [Kurze Erklärung auf Deutsch]"""
+Begründung: [Kurze Erklärung auf Deutsch]
+
+WICHTIG: Überspringe keine Aufgabe!"""
 
     response = claude_client.messages.create(
         model="claude-4-opus-20250514",
-        max_tokens=2000,
+        max_tokens=3000,
         temperature=0.1,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -150,21 +196,22 @@ KRITISCHE REGELN:
 - Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
 - Wenn nur α + β gegeben ist (ohne α = β), ist die Funktion NICHT homogen
 - Bei Multiple Choice: Prüfe JEDE Option einzeln
+- Beantworte ALLE Aufgaben die du im Text findest
 
 ANALYSIERE:
 {ocr_text}
 
-FORMAT:
+FORMAT für JEDE gefundene Aufgabe:
 Aufgabe [Nr]: [Antwort]
 Begründung: [Kurze Erklärung auf Deutsch]"""
 
     response = openai_client.chat.completions.create(
         model=GPT_MODEL,
         messages=[
-            {"role": "system", "content": "Du bist ein präziser Mathematik-Experte."},
+            {"role": "system", "content": "Du bist ein präziser Mathematik-Experte. Beantworte ALLE Aufgaben im Text."},
             {"role": "user", "content": prompt}
         ],
-        max_tokens=2000,
+        max_tokens=3000,
         temperature=0.1
     )
     
@@ -186,7 +233,16 @@ def achieve_consensus_multi(ocr_text):
     gpt_answers = extract_answers(gpt_solution)
     
     # Debug Info
-    with st.expander("🔍 Debug: Antworten"):
+    with st.expander("🔍 Debug: Rohe Antworten"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("**Claude:**")
+            st.code(claude_solution)
+        with col2:
+            st.write(f"**{GPT_MODEL}:**")
+            st.code(gpt_solution)
+    
+    with st.expander("🔍 Extrahierte Antworten"):
         col1, col2 = st.columns(2)
         with col1:
             st.write("**Claude:**")
@@ -198,6 +254,7 @@ def achieve_consensus_multi(ocr_text):
     # Vergleiche
     all_tasks = set(claude_answers.keys()) | set(gpt_answers.keys())
     consensus = True
+    discrepancies = []
     
     for task in sorted(all_tasks):
         claude_ans = claude_answers.get(task, "?")
@@ -205,25 +262,29 @@ def achieve_consensus_multi(ocr_text):
         
         if claude_ans != gpt_ans:
             consensus = False
-            st.warning(f"Diskrepanz bei {task}: Claude={claude_ans}, GPT={gpt_ans}")
+            discrepancies.append(f"{task}: Claude={claude_ans}, GPT={gpt_ans}")
+            st.warning(f"❌ Diskrepanz bei {task}: Claude={claude_ans}, GPT={gpt_ans}")
+        else:
+            st.success(f"✅ Einigkeit bei {task}: {claude_ans}")
     
     if consensus and claude_answers:
-        st.success("✅ Modelle sind sich einig!")
+        st.success("🎉 Modelle sind sich einig!")
         return claude_solution
     else:
         st.info("🔄 Verwende Claude mit Verifikation")
-        # Selbst-Verifikation
+        # Selbst-Verifikation mit Diskrepanz-Info
         verify_prompt = (
             "Prüfe diese Lösung kritisch:\n\n"
             f"AUFGABE:\n{ocr_text}\n\n"
             f"LÖSUNG:\n{claude_solution}\n\n"
+            f"DISKREPANZEN MIT ANDEREM MODELL:\n" + "\n".join(discrepancies) + "\n\n"
             "Bei Homogenität: f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β!\n\n"
             "Gib die FINALE KORREKTE Lösung im gleichen Format."
         )
 
         response = claude_client.messages.create(
             model="claude-4-opus-20250514",
-            max_tokens=2000,
+            max_tokens=3000,
             temperature=0.2,
             messages=[{"role": "user", "content": verify_prompt}]
         )
@@ -233,29 +294,46 @@ def achieve_consensus_multi(ocr_text):
 # --- MAIN UI ---
 uploaded_file = st.file_uploader(
     "**Klausuraufgabe hochladen...**",
-    type=["png", "jpg", "jpeg"]
+    type=["png", "jpg", "jpeg"],
+    help="Lade ein klares Bild der Klausuraufgabe hoch"
 )
 
 if uploaded_file is not None:
     # Bild anzeigen
     image = Image.open(uploaded_file)
-    st.image(image, caption="Hochgeladene Klausuraufgabe", use_container_width=True)
+    st.image(image, caption=f"Hochgeladene Klausuraufgabe ({image.width}x{image.height}px)", use_container_width=True)
     
-    # GEMINI OCR
-    file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest()
-    with st.spinner("📖 Lese Text mit Gemini..."):
+    # Datei-Info
+    file_bytes = uploaded_file.getvalue()
+    file_hash = hashlib.md5(file_bytes).hexdigest()
+    st.info(f"📄 Datei: {uploaded_file.name} | Größe: {len(file_bytes)/1024:.1f} KB | Hash: {file_hash[:8]}...")
+    
+    # GEMINI OCR mit Status
+    with st.spinner("📖 Lese Text mit Gemini Flash (kann 10-20 Sekunden dauern)..."):
         try:
-            ocr_text = extract_text_with_gemini(image, file_hash)
-            st.success(f"✅ OCR erfolgreich: {len(ocr_text)} Zeichen extrahiert")
+            ocr_text = extract_text_with_gemini(file_bytes, file_hash)
+            
+            # OCR Erfolgsmeldung
+            char_count = len(ocr_text)
+            if char_count < 500:
+                st.warning(f"⚠️ Nur {char_count} Zeichen extrahiert - möglicherweise unvollständig!")
+            else:
+                st.success(f"✅ OCR erfolgreich: {char_count} Zeichen extrahiert")
+                
         except Exception as e:
             st.error(f"❌ OCR Fehler: {str(e)}")
             st.stop()
     
-    with st.expander("📝 OCR-Text (Gemini)"):
+    # OCR Text anzeigen
+    with st.expander(f"📝 OCR-Text (Gemini) - {len(ocr_text)} Zeichen"):
         st.code(ocr_text)
+        # Aufgaben-Erkennung
+        found_tasks = re.findall(r'Aufgabe\s+(\d+)', ocr_text, re.IGNORECASE)
+        if found_tasks:
+            st.info(f"Erkannte Aufgaben: {', '.join(set(found_tasks))}")
     
     # Solve Button
-    if st.button("🧮 Mit Multi-Model Consensus lösen", type="primary"):
+    if st.button("🧮 Mit Multi-Model Consensus lösen", type="primary", disabled=(len(ocr_text) < 100)):
         st.markdown("---")
         st.markdown("### 🤝 Consensus-Prozess:")
         
@@ -265,7 +343,7 @@ if uploaded_file is not None:
             
             # Ergebnisse anzeigen
             st.markdown("---")
-            st.markdown("### 📊 Lösung:")
+            st.markdown("### 📊 Finale Lösung:")
             
             lines = final_solution.split('\n')
             for line in lines:
@@ -276,11 +354,13 @@ if uploaded_file is not None:
                             st.markdown(f"### {parts[0]}: **{parts[1].strip()}**")
                     elif line.startswith('Begründung:'):
                         st.markdown(f"*{line}*")
+                    elif not line.startswith('---'):
+                        st.markdown(line)
                         
         except Exception as e:
-            st.error(f"Fehler: {str(e)}")
-            logger.error(f"Processing error: {str(e)}")
+            st.error(f"Fehler beim Lösen: {str(e)}")
+            logger.error(f"Processing error: {str(e)}", exc_info=True)
 
 # Footer
 st.markdown("---")
-st.caption(f"Multi-Model Consensus System | Gemini OCR + Claude 4 Opus + {GPT_MODEL}")
+st.caption(f"Multi-Model Consensus System | Gemini 1.5 Flash OCR + Claude 4 Opus + {GPT_MODEL}")
