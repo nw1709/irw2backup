@@ -1,323 +1,215 @@
 import streamlit as st
 from anthropic import Anthropic
+from openai import OpenAI
 from PIL import Image
 import google.generativeai as genai
 import logging
 import hashlib
 import re
-import time
-import io  # FEHLTE!
 
 # --- Logger Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- API Key Validation ---
 def validate_keys():
     required_keys = {
         'gemini_key': ('AIza', "Gemini"),
-        'claude_key': ('sk-ant', "Claude")
+        'claude_key': ('sk-ant', "Claude"),
+        'openai_key': ('sk-', "OpenAI")
     }
+    missing = []
     
     for key, (prefix, name) in required_keys.items():
         if key not in st.secrets:
-            st.error(f"❌ {name} API Key fehlt in secrets.toml")
-            st.stop()
+            missing.append(name)
         elif not st.secrets[key].startswith(prefix):
-            st.error(f"❌ {name} API Key ist ungültig")
-            st.stop()
+            missing.append(f"{name} (invalid)")
     
-    st.sidebar.success("✅ Alle API Keys validiert")
+    if missing:
+        st.error(f"Fehlende API Keys: {', '.join(missing)}")
+        st.stop()
 
-# --- UI Setup ---
-st.set_page_config(
-    page_title="Koifox-Bot", 
-    page_icon="🦊",
-    layout="centered"
-)
-
-st.title("🦊 Koifox-Bot")
-st.markdown("*Optimierte Version - Gemini OCR + Claude Solver*")
-
-# Validate keys
 validate_keys()
 
-# --- Initialize APIs ---
-@st.cache_resource
-def init_apis():
-    """Initialisiert APIs einmalig"""
-    genai.configure(api_key=st.secrets["gemini_key"])
-    vision_model = genai.GenerativeModel("gemini-1.5-flash")
-    claude_client = Anthropic(api_key=st.secrets["claude_key"])
-    logger.info("APIs initialisiert")
-    return vision_model, claude_client
+# --- UI-Einstellungen ---
+st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
+st.title("🦊 Koifox-Bot")
 
-vision_model, claude_client = init_apis()
+# --- API Clients ---
+genai.configure(api_key=st.secrets["gemini_key"])
+vision_model = genai.GenerativeModel("gemini-1.5-flash")
+claude_client = Anthropic(api_key=st.secrets["claude_key"])
+openai_client = OpenAI(api_key=st.secrets["openai_key"])
 
-# --- Stats in Sidebar ---
-if 'stats' not in st.session_state:
-    st.session_state.stats = {
-        'ocr_calls': 0,
-        'solve_calls': 0,
-        'errors': 0
-    }
+# --- Test welches GPT Modell verfügbar ist ---
+@st.cache_data
+def get_available_gpt_model():
+    """Testet welches GPT Modell tatsächlich funktioniert"""
+    test_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o"]
+    
+    for model in test_models:
+        try:
+            response = openai_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "Test"}],
+                max_tokens=10
+            )
+            logger.info(f"Model {model} ist verfügbar")
+            return model
+        except Exception as e:
+            logger.warning(f"Model {model} nicht verfügbar: {str(e)}")
+            continue
+    
+    return "gpt-3.5-turbo"  # Fallback
 
-st.sidebar.markdown("### 📊 Session Stats")
-st.sidebar.metric("OCR Calls", st.session_state.stats['ocr_calls'])
-st.sidebar.metric("Solve Calls", st.session_state.stats['solve_calls'])
-st.sidebar.metric("Errors", st.session_state.stats['errors'])
+GPT_MODEL = get_available_gpt_model()
+st.sidebar.info(f"🤖 Verwende: Claude + {GPT_MODEL}")
 
-if st.sidebar.button("🗑️ Reset Session"):
-    st.cache_data.clear()
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    st.rerun()
-
-# --- OCR Function ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def extract_text_with_gemini(_image_bytes, file_hash):
-    """OCR mit Gemini - gecached"""
+# --- OCR mit Caching ---
+@st.cache_data(ttl=3600)
+def extract_text_with_gemini(_image, file_hash):
+    """Extrahiert Text aus Bild"""
     try:
-        logger.info(f"Starting Gemini OCR for hash: {file_hash[:8]}...")
-        st.session_state.stats['ocr_calls'] += 1
-        
-        # Image from bytes
-        image = Image.open(io.BytesIO(_image_bytes))
-        
-        # OCR prompt
-        ocr_prompt = """
-        Extract ALL text from this exam image:
-        1. Start from the very top
-        2. Read line by line until the bottom
-        3. Include ALL text: questions, formulas, values, options (A,B,C,D,E)
-        4. Include question numbers (e.g. "Aufgabe 45 (5 RP)")
-        5. Preserve mathematical notation exactly
-        6. DO NOT skip anything
-        7. DO NOT interpret or solve
-        
-        Output the text EXACTLY as written.
-        """
-        
-        # Call Gemini
         response = vision_model.generate_content(
-            [ocr_prompt, image],
-            generation_config={
-                "temperature": 0,
-                "top_p": 1,
-                "top_k": 1,
-                "max_output_tokens": 8192
-            }
+            [
+                "Extract ALL text from this exam image EXACTLY as written. Include all question numbers, text, and answer options. Do NOT interpret.",
+                _image
+            ],
+            generation_config={"temperature": 0, "max_output_tokens": 8000}
         )
-        
-        ocr_text = response.text.strip()
-        logger.info(f"Gemini OCR completed: {len(ocr_text)} characters")
-        
-        # Validate OCR
-        if len(ocr_text) < 100:
-            raise ValueError(f"OCR zu kurz: nur {len(ocr_text)} Zeichen")
-        
-        return ocr_text
-        
+        return response.text.strip()
     except Exception as e:
         logger.error(f"Gemini OCR Error: {str(e)}")
-        st.session_state.stats['errors'] += 1
         raise e
+
+# --- Lösungsextraktion ---
+def extract_answers(solution_text):
+    """Extrahiert strukturierte Antworten aus Lösungstext"""
+    answers = {}
+    lines = solution_text.split('\n')
+    
+    for line in lines:
+        match = re.search(r'Aufgabe\s*(\d+)\s*:\s*([A-E,\s]+|\d+|[\d,]+)', line, re.IGNORECASE)
+        if match:
+            task_num = match.group(1)
+            answer = match.group(2).strip()
+            if any(letter in answer.upper() for letter in 'ABCDE'):
+                answer = ''.join(sorted(c for c in answer.upper() if c in 'ABCDE'))
+            answers[f"Aufgabe {task_num}"] = answer
+    
+    return answers
 
 # --- Claude Solver ---
 def solve_with_claude(ocr_text):
-    """Claude löst basierend auf OCR Text"""
-    try:
-        logger.info("Starting Claude solver...")
-        st.session_state.stats['solve_calls'] += 1
-        
-        # Find all task numbers in OCR text
-        task_numbers = re.findall(r'Aufgabe\s+(\d+)', ocr_text, re.IGNORECASE)
-        logger.info(f"Gefundene Aufgaben: {task_numbers}")
-        
-        solve_prompt = f"""Du bist ein Experte für "Internes Rechnungswesen (31031)" an der Fernuni Hagen.
+    """Claude löst die Aufgabe"""
+    
+    prompt = f"""Du bist ein Experte für "Internes Rechnungswesen (31031)" an der Fernuni Hagen.
 
-WICHTIGE REGELN:
-- Bei Homogenität: f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
-- Wenn nur "α + β = k" gegeben ist, kann α ≠ β sein → NICHT homogen
+KRITISCHE REGELN:
+- Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
+- Wenn nur α + β gegeben ist (ohne α = β), ist die Funktion NICHT homogen
 - Bei Multiple Choice: Prüfe JEDE Option einzeln
-- Verwende präzise Fachterminologie
 
-AUFGABENTEXT (via OCR):
+ANALYSIERE DIESEN TEXT:
 {ocr_text}
 
-ANWEISUNGEN:
-1. Beantworte ALLE Aufgaben die du im Text findest
-2. Überspringe KEINE Aufgabe
-3. Format für JEDE Aufgabe:
+FORMAT:
+Aufgabe [Nr]: [Antwort]
+Begründung: [Kurze Erklärung auf Deutsch]"""
 
-Aufgabe [Nummer]: [Antwort]
-Begründung: [Kurze Erklärung auf Deutsch]
-
-Gefundene Aufgaben im Text: {', '.join(task_numbers) if task_numbers else 'Bitte selbst identifizieren'}
-
-WICHTIG: Stelle sicher, dass du ALLE Aufgaben beantwortest!"""
-
-        # Call Claude with retry logic
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = claude_client.messages.create(
-                    model="claude-4-opus-20250514",
-                    max_tokens=4096,
-                    temperature=0.1,
-                    top_p=1.0,
-                    system="Du bist ein präziser Experte für deutsches Controlling. Beantworte ALLE Aufgaben im Text.",
-                    messages=[{
-                        "role": "user",
-                        "content": solve_prompt
-                    }]
-                )
-                
-                solution = response.content[0].text
-                logger.info("Claude solver completed successfully")
-                return solution
-                
-            except Exception as e:
-                if "rate_limit" in str(e) and attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    logger.warning(f"Rate limit hit, waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    raise e
-                    
-    except Exception as e:
-        logger.error(f"Claude Solver Error: {str(e)}")
-        st.session_state.stats['errors'] += 1
-        raise e
-
-# --- Solution Parser ---
-def parse_and_display_solution(solution_text, expected_tasks):
-    """Parse und zeige Lösung strukturiert"""
+    response = claude_client.messages.create(
+        model="claude-4-opus-20250514",
+        max_tokens=2000,
+        temperature=0.1,
+        messages=[{"role": "user", "content": prompt}]
+    )
     
-    # Extract all answers
-    pattern = r'Aufgabe\s+(\d+)\s*:\s*([^\n]+)'
-    matches = re.findall(pattern, solution_text, re.IGNORECASE)
+    return response.content[0].text
+
+# --- GPT Solver ---
+def solve_with_gpt(ocr_text):
+    """GPT löst die Aufgabe"""
     
-    if not matches:
-        st.error("❌ Keine Lösungen im erwarteten Format gefunden")
-        st.code(solution_text)
-        return
+    prompt = f"""Du bist ein Experte für "Internes Rechnungswesen (31031)" an der Fernuni Hagen.
+
+KRITISCHE REGELN:
+- Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
+- Wenn nur α + β gegeben ist (ohne α = β), ist die Funktion NICHT homogen
+- Bei Multiple Choice: Prüfe JEDE Option einzeln
+
+ANALYSIERE:
+{ocr_text}
+
+FORMAT:
+Aufgabe [Nr]: [Antwort]
+Begründung: [Kurze Erklärung auf Deutsch]"""
+
+    response = openai_client.chat.completions.create(
+        model=GPT_MODEL,
+        messages=[
+            {"role": "system", "content": "Du bist ein präziser Mathematik-Experte."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=2000,
+        temperature=0.1
+    )
     
-    # Display solutions
-    found_tasks = []
-    for task_num, answer in matches:
-        found_tasks.append(task_num)
-        st.markdown(f"### Aufgabe {task_num}: **{answer.strip()}**")
+    return response.choices[0].message.content
+
+# --- Consensus System ---
+def achieve_consensus_multi(ocr_text):
+    """Consensus zwischen Claude und GPT"""
+    
+    # Lösungen generieren
+    with st.spinner("Claude löst..."):
+        claude_solution = solve_with_claude(ocr_text)
+    
+    with st.spinner(f"{GPT_MODEL} löst..."):
+        gpt_solution = solve_with_gpt(ocr_text)
+    
+    # Antworten extrahieren
+    claude_answers = extract_answers(claude_solution)
+    gpt_answers = extract_answers(gpt_solution)
+    
+    # Debug Info
+    with st.expander("🔍 Debug: Antworten"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("**Claude:**")
+            st.json(claude_answers)
+        with col2:
+            st.write(f"**{GPT_MODEL}:**")
+            st.json(gpt_answers)
+    
+    # Vergleiche
+    all_tasks = set(claude_answers.keys()) | set(gpt_answers.keys())
+    consensus = True
+    
+    for task in sorted(all_tasks):
+        claude_ans = claude_answers.get(task, "?")
+        gpt_ans = gpt_answers.get(task, "?")
         
-        # Find reasoning
-        begr_pattern = rf'Aufgabe\s+{task_num}.*?\nBegründung:\s*([^\n]+(?:\n(?!Aufgabe)[^\n]+)*)'
-        begr_match = re.search(begr_pattern, solution_text, re.IGNORECASE | re.DOTALL)
-        
-        if begr_match:
-            st.markdown(f"*Begründung: {begr_match.group(1).strip()}*")
-        
-        st.markdown("---")
+        if claude_ans != gpt_ans:
+            consensus = False
+            st.warning(f"Diskrepanz bei {task}: Claude={claude_ans}, GPT={gpt_ans}")
     
-    # Check completeness
-    if expected_tasks:
-        missing = set(expected_tasks) - set(found_tasks)
-        if missing:
-            st.warning(f"⚠️ Fehlende Aufgaben: {', '.join(sorted(missing))}")
+    if consensus and claude_answers:
+        st.success("✅ Modelle sind sich einig!")
+        return claude_solution
+    else:
+        st.info("🔄 Verwende Claude mit Verifikation")
+        # Selbst-Verifikation
+        verify_prompt = f"""Prüfe diese Lösung kritisch:
 
-# --- MAIN UI ---
-uploaded_file = st.file_uploader(
-    "**Klausuraufgabe hochladen**",
-    type=["png", "jpg", "jpeg"],
-    help="PNG/JPG/JPEG Bilder"
-)
+AUFGABE:
+{ocr_text}
 
-if uploaded_file is not None:
-    # Process upload
-    file_bytes = uploaded_file.getvalue()
-    file_hash = hashlib.md5(file_bytes).hexdigest()
-    
-    # Display image
-    image = Image.open(uploaded_file)
-    st.image(image, caption="Hochgeladene Klausuraufgabe", use_container_width=True)
-    
-    # Info
-    st.info(f"📄 Datei: {uploaded_file.name} | Größe: {len(file_bytes)/1024:.1f} KB")
-    
-    # OCR Section
-    st.markdown("### 1️⃣ Texterkennung (OCR)")
-    
-    try:
-        with st.spinner("🔍 Lese Text mit Gemini..."):
-            # Use bytes for caching
-            ocr_text = extract_text_with_gemini(file_bytes, file_hash)
-        
-        # Show OCR result
-        with st.expander(f"📝 OCR Ergebnis ({len(ocr_text)} Zeichen)", expanded=False):
-            st.code(ocr_text)
-            
-            # Find tasks
-            found_tasks = re.findall(r'Aufgabe\s+(\d+)', ocr_text, re.IGNORECASE)
-            if found_tasks:
-                st.success(f"✅ Gefundene Aufgaben: {', '.join(set(found_tasks))}")
-            else:
-                st.warning("⚠️ Keine Aufgaben-Nummern gefunden")
-    
-    except Exception as e:
-        st.error(f"❌ OCR Fehler: {str(e)}")
-        st.stop()
-    
-    # Solve Section
-    st.markdown("### 2️⃣ Aufgaben lösen")
-    
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        solve_button = st.button(
-            "🧮 Alle Aufgaben lösen",
-            type="primary",
-            disabled=not ocr_text
-        )
-    with col2:
-        show_debug = st.checkbox("Debug", value=False)
-    
-    if solve_button:
-        try:
-            with st.spinner("💭 Claude löst die Aufgaben..."):
-                solution = solve_with_claude(ocr_text)
-            
-            if show_debug:
-                with st.expander("🔍 Rohe Claude-Antwort"):
-                    st.code(solution)
-            
-            # Display solutions
-            st.markdown("### 3️⃣ Lösungen")
-            parse_and_display_solution(solution, found_tasks)
-            
-            # Success message
-            st.success("✅ Fertig!")
-            
-        except Exception as e:
-            st.error(f"❌ Fehler beim Lösen: {str(e)}")
+LÖSUNG:
+{claude_solution}
 
-else:
-    # Instructions
-    st.markdown("""
-    ### 📖 Anleitung:
-    1. Lade ein Foto der Klausuraufgabe hoch
-    2. Der Bot liest den Text automatisch (OCR)
-    3. Klicke auf "Aufgaben lösen"
-    4. Erhalte präzise Lösungen mit Begründungen
-    
-    **Unterstützte Aufgabentypen:**
-    - Multiple Choice (x aus 5)
-    - Rechenaufgaben
-    - Theoretische Fragen
-    - Alle Themen aus "Internes Rechnungswesen"
-    """)
+Bei Homogenität: f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β!
 
-# Footer
-st.markdown("---")
-st.caption("Koifox-Bot v4.0 | Optimized for reliability")
+Gib die FINALE KORREKTE Lösung im gleichen Format."""
+
+        response =
