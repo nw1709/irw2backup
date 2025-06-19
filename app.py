@@ -2,7 +2,7 @@ import streamlit as st
 from anthropic import Anthropic
 from PIL import Image
 import google.generativeai as genai
-from openai
+from openai import OpenAI
 import logging
 import hashlib
 import base64
@@ -137,3 +137,167 @@ def solve_with_fallback(prompt):
     # Versuch 1: Claude 4 Opus
     if "claude_key" in st.secrets:
         try:
+            logger.info("Trying Claude 4 Opus")
+            client = Anthropic(api_key=st.secrets["claude_key"])
+            response = client.messages.create(
+                model="claude-4-opus-20250514",
+                max_tokens=4000,
+                temperature=0,
+                top_p=1.0,
+                messages=[{
+                    "role": "user",
+                    "content": prompt
+                }]
+            )
+            st.success("✅ Gelöst mit Claude 4 Opus")
+            return response.content[0].text
+        except Exception as e:
+            logger.error(f"Claude failed: {e}")
+            st.warning("⚠️ Claude nicht verfügbar, verwende GPT-4...")
+    
+    # Versuch 2: GPT-4 Turbo
+    if "openai_key" in st.secrets:
+        try:
+            logger.info("Trying GPT-4 Turbo")
+            response = openai_client.chat.completions.create(
+                model="gpt-4-turbo-preview",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Du bist ein Experte für Internes Rechnungswesen an der Fernuni Hagen."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                max_tokens=4000,
+                temperature=0,
+                top_p=1.0
+            )
+            st.info("ℹ️ Gelöst mit GPT-4 Turbo (Fallback)")
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"GPT-4 failed: {e}")
+    
+    raise Exception("Alle Solving-Dienste nicht verfügbar")
+
+# --- UI Optionen ---
+debug_mode = st.checkbox("🔍 Debug-Modus", value=False, help="Zeigt OCR-Ergebnis und Details")
+
+# --- Datei-Upload ---
+uploaded_file = st.file_uploader(
+    "**Klausuraufgabe hochladen...**",
+    type=["png", "jpg", "jpeg"],
+    key="file_uploader"
+)
+
+if uploaded_file is not None:
+    try:
+        # Eindeutiger Hash für die Datei
+        file_bytes = uploaded_file.getvalue()
+        file_hash = hashlib.md5(file_bytes).hexdigest()
+        
+        # Bild laden und anzeigen
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Hochgeladene Klausuraufgabe", use_container_width=True)
+        
+        # OCR mit Fallback
+        with st.spinner("Lese Text..."):
+            try:
+                ocr_text = extract_text_with_fallback(image, file_hash)
+            except Exception as e:
+                st.error(f"❌ OCR fehlgeschlagen: {str(e)}")
+                st.stop()
+            
+        # Debug: OCR-Ergebnis anzeigen
+        if debug_mode:
+            with st.expander("🔍 OCR-Ergebnis", expanded=False):
+                st.code(ocr_text)
+                st.info(f"File Hash: {file_hash[:8]}...")
+        
+        # Button zum Lösen
+        if st.button("🧮 Aufgaben lösen", type="primary"):
+            
+            # Prompt (gleich für alle Modelle)
+            prompt = f"""You are a highly qualified accounting expert with PhD-level 
+knowledge of the university course "Internes Rechnungswesen (31031)" at Fernuniversität Hagen. 
+Your task is to answer exam questions with 100% accuracy.
+
+THEORETICAL SCOPE
+Use only the decision-oriented German managerial-accounting (Controlling) framework:
+- Cost-type, cost-center and cost-unit accounting (Kostenarten-, Kostenstellen-, Kostenträgerrechnung)
+- Full, variable, marginal, standard (Plankosten-) and process/ABC costing systems
+- Flexible and Grenzplankostenrechnung variance analysis
+- Single- and multi-level contribution-margin accounting and break-even logic
+- Causality & allocation (Verursachungs- und Zurechnungsprinzip)
+- Business-economics MRS convention (MRS = MP₂ / MP₁ unless stated otherwise)
+- Activity-analysis production & logistics models (LP, Standort- & Transportprobleme)
+- Marketing segmentation, price-elasticity, contribution-based pricing & mix planning
+
+WICHTIG: Analysiere NUR den folgenden OCR-Text. Erfinde KEINE anderen Aufgaben! 
+Sei extrem präzise und verwende die Lösungswege und die Terminologie der Fernuni Hagen. Es gibt absolut keinen Raum für Fehler!
+
+OCR-TEXT START:
+{ocr_text}
+OCR-TEXT ENDE
+
+KRITISCHE ANWEISUNGEN:
+1. Lies die Aufgabe SEHR sorgfältig
+2. Bei Rechenaufgaben:
+   - Zeige JEDEN Rechenschritt
+   - Prüfe dein Ergebnis nochmal
+3. Bei Multiple Choice: Prüfe jede Option einzeln
+4. VERIFIZIERE deine Antwort bevor du antwortest
+5. Stelle SICHER, dass deine Antwort mit deiner Analyse übereinstimmt!
+
+FORMAT - WICHTIG:
+Aufgabe [Nr]: [NUR die finale Antwort - Zahl oder Buchstabe(n)]
+Begründung: [1 Satz auf Deutsch]
+"""
+            
+            if debug_mode:
+                with st.expander("🔍 Prompt", expanded=False):
+                    st.code(prompt)
+            
+            # Solving mit Fallback
+            with st.spinner("Löse Aufgabe..."):
+                try:
+                    result = solve_with_fallback(prompt)
+                except Exception as e:
+                    st.error(f"❌ Alle Dienste nicht verfügbar: {str(e)}")
+                    st.stop()
+            
+            # Ergebnisse anzeigen
+            st.markdown("---")
+            st.markdown("### Lösung:")
+            
+            # Formatierte Ausgabe
+            lines = result.split('\n')
+            for line in lines:
+                if line.strip():
+                    if line.startswith('Aufgabe'):
+                        parts = line.split(':', 1)
+                        if len(parts) == 2:
+                            st.markdown(f"### {parts[0]}: **{parts[1].strip()}**")
+                        else:
+                            st.markdown(f"### {line}")
+                    elif line.startswith('Begründung:'):
+                        st.markdown(f"*{line}*")
+                    else:
+                        st.markdown(line)
+                        
+            # Info über verwendete APIs
+            st.info("💡 OCR-Ergebnisse werden gecached, Lösungen werden immer neu berechnet.")
+            
+            # Kostenwarnung bei GPT-4
+            if "⚠️" in st.session_state.get("last_warning", ""):
+                st.warning("💰 Hinweis: GPT-4 Turbo ist teurer als Claude/Gemini")
+                    
+    except Exception as e:
+        logger.error(f"General error: {str(e)}")
+        st.error(f"❌ Fehler: {str(e)}")
+
+# --- Footer ---
+st.markdown("---")
+st.caption("Made by Fox | Multi-API mit automatischem Fallback")
