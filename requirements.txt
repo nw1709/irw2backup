@@ -1,6 +1,9 @@
 streamlit
-PyPDF2
+anthropic
+google-generativeai
 google-api-python-client
-google-generativeai>=0.3.0
-anthropic>=0.25.0
-Pillow>=10.0.0
+google-auth-httplib2
+google-auth-oauthlib
+Pillow
+pypdf2
+openai
