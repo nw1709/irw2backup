@@ -33,10 +33,7 @@ def validate_keys():
         st.stop()
     
     # Check optional
-    has_openai = False
-    if 'openai_key' in st.secrets and st.secrets['openai_key'].startswith('sk-'):
-        has_openai = True
-    
+    has_openai = 'openai_key' in st.secrets and st.secrets['openai_key'].startswith('sk-')
     return has_openai
 
 HAS_OPENAI = validate_keys()
@@ -45,11 +42,6 @@ HAS_OPENAI = validate_keys()
 st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
 st.title("🦊 Koifox-Bot")
 
-if HAS_OPENAI:
-    st.markdown("*Multi-Model Consensus System (Claude + GPT)*")
-else:
-    st.markdown("*Single-Model System (nur Claude verfügbar)*")
-
 # --- API Clients ---
 genai.configure(api_key=st.secrets["gemini_key"])
 vision_model = genai.GenerativeModel("gemini-1.5-flash")
@@ -57,6 +49,9 @@ claude_client = Anthropic(api_key=st.secrets["claude_key"])
 
 if HAS_OPENAI:
     openai_client = OpenAI(api_key=st.secrets["openai_key"])
+    st.markdown("*Multi-Model Consensus System (Claude + GPT)*")
+else:
+    st.markdown("*Single-Model System (nur Claude verfügbar)*")
 
 # --- Test welches GPT Modell verfügbar ist ---
 @st.cache_data
@@ -65,17 +60,10 @@ def get_available_gpt_model():
     if not HAS_OPENAI:
         return None
         
-    test_models = [
-        "gpt-3.5-turbo",  # Fast immer verfügbar
-        "gpt-4",
-        "gpt-4-turbo",
-        "gpt-4o",
-        "gpt-4o-mini"
-    ]
+    test_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini"]
     
     for model in test_models:
         try:
-            # Teste mit minimalem Request
             response = openai_client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": "Test"}],
@@ -120,13 +108,23 @@ def extract_answers(solution_text):
     lines = solution_text.split('\n')
     
     for line in lines:
-        match = re.search(r'Aufgabe\s*(\d+)\s*:\s*([A-E,\s]+|\d+|[\d,]+)', line, re.IGNORECASE)
-        if match:
-            task_num = match.group(1)
-            answer = match.group(2).strip()
-            if any(letter in answer for letter in 'ABCDE'):
-                answer = ''.join(sorted(c for c in answer.upper() if c in 'ABCDE'))
-            answers[f"Aufgabe {task_num}"] = answer
+        # Flexibleres Pattern für verschiedene Formate
+        patterns = [
+            r'Aufgabe\s*(\d+)\s*:\s*([A-E,\s]+|\d+[\d,]*)',
+            r'AUFGABE\s*(\d+)\s*:\s*([A-E,\s]+|\d+[\d,]*)',
+            r'Task\s*(\d+)\s*:\s*([A-E,\s]+|\d+[\d,]*)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, line, re.IGNORECASE)
+            if match:
+                task_num = match.group(1)
+                answer = match.group(2).strip()
+                if any(letter in answer.upper() for letter in 'ABCDE'):
+                    # Normalisiere Multiple-Choice
+                    answer = ''.join(sorted(c for c in answer.upper() if c in 'ABCDE'))
+                answers[f"Aufgabe {task_num}"] = answer
+                break
     
     return answers
 
@@ -141,19 +139,23 @@ KRITISCHE REGELN:
 - Wenn nur α + β gegeben ist (ohne α = β), ist die Funktion NICHT homogen
 - Prüfe ALLE Bedingungen bevor du Schlüsse ziehst
 
-ANALYSIERE DIESEN TEXT (Iteration {iteration}):
+ANALYSIERE DIESEN TEXT:
 {ocr_text}
 
-FORMAT:
-Aufgabe [Nr]: [Antwort]
-Begründung: [Erklärung auf Deutsch]
+FORMAT (WICHTIG):
+Aufgabe [Nr]: [Antwort - NUR Buchstabe(n) oder Zahl]
+Begründung: [Kurze Erklärung auf Deutsch]
 
-Denke Schritt für Schritt und prüfe deine Antwort!"""
+Beispiel:
+Aufgabe 1: BD
+Begründung: Optionen B und D sind korrekt, weil...
+
+DENKE SCHRITT FÜR SCHRITT!"""
 
     response = claude_client.messages.create(
         model="claude-4-opus-20250514",
         max_tokens=2000,
-        temperature=0.1 if iteration == 1 else 0.2,  # Höher bei späteren Iterationen
+        temperature=0.1 if iteration == 1 else 0.2,
         messages=[{"role": "user", "content": prompt}]
     )
     
@@ -161,7 +163,7 @@ Denke Schritt für Schritt und prüfe deine Antwort!"""
 
 # --- Single Model Solution ---
 def solve_single_model(ocr_text):
-    """Lösung nur mit Claude (wenn kein GPT verfügbar)"""
+    """Lösung nur mit Claude (wenn kein GPT verfügbar oder bei Uneinigkeit)"""
     st.info("🔄 Verwende erweiterte Claude-Analyse...")
     
     # Erste Lösung
@@ -170,15 +172,19 @@ def solve_single_model(ocr_text):
     
     # Selbst-Verifikation
     with st.spinner("Claude verifiziert eigene Lösung..."):
-        verify_prompt = f"""Prüfe diese Lösung auf Fehler:
+        verify_prompt = f"""Du bist ein ZWEITER Experte. Prüfe diese Lösung kritisch:
 
 AUFGABE:
 {ocr_text}
 
-LÖSUNG ZU PRÜFEN:
+ZU PRÜFENDE LÖSUNG:
 {solution1}
 
-Ist die Lösung korrekt? Wenn nein, gib die KORREKTE Lösung im gleichen Format."""
+WICHTIG: Bei Homogenitätsprüfung - f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β!
+
+Gib die FINALE KORREKTE Lösung im Format:
+Aufgabe [Nr]: [Antwort]
+Begründung: [Erklärung]"""
 
         response = claude_client.messages.create(
             model="claude-4-opus-20250514",
@@ -216,28 +222,50 @@ Begründung: [Erklärung auf Deutsch]"""
 
         response = openai_client.chat.completions.create(
             model=gpt_model,
-            messages=[{"role": "user", "content": gpt_prompt}],
+            messages=[
+                {"role": "system", "content": "Du bist ein präziser Mathematik-Experte. Bei Homogenität: Eine Funktion ist NUR homogen wenn alle Bedingungen erfüllt sind."},
+                {"role": "user", "content": gpt_prompt}
+            ],
             max_tokens=2000,
             temperature=0.1
         )
         gpt_solution = response.choices[0].message.content
     
+    # Debug Info
+    with st.expander("🔍 Debug: Rohe Antworten"):
+        st.markdown("**Claude:**")
+        st.code(claude_solution)
+        st.markdown("**GPT:**")
+        st.code(gpt_solution)
+    
     # Vergleiche
     claude_answers = extract_answers(claude_solution)
     gpt_answers = extract_answers(gpt_solution)
     
-    consensus = True
-    for task in set(claude_answers.keys()) | set(gpt_answers.keys()):
-        if claude_answers.get(task) != gpt_answers.get(task):
-            consensus = False
-            st.warning(f"Diskrepanz bei {task}: Claude={claude_answers.get(task)}, GPT={gpt_answers.get(task)}")
+    # Debug Info
+    st.write("Extrahierte Antworten:")
+    st.write(f"Claude: {claude_answers}")
+    st.write(f"GPT: {gpt_answers}")
     
-    if consensus:
+    consensus = True
+    all_tasks = set(claude_answers.keys()) | set(gpt_answers.keys())
+    
+    for task in sorted(all_tasks):
+        claude_ans = claude_answers.get(task, "?")
+        gpt_ans = gpt_answers.get(task, "?")
+        
+        if claude_ans != gpt_ans:
+            consensus = False
+            st.warning(f"Diskrepanz bei {task}: Claude={claude_ans}, GPT={gpt_ans}")
+        else:
+            st.success(f"✅ Einigkeit bei {task}: {claude_ans}")
+    
+    if consensus and claude_answers:  # Prüfe ob überhaupt Antworten gefunden wurden
         st.success("✅ Modelle sind sich einig!")
-        return True, claude_solution
+        return claude_solution
     else:
         st.error("❌ Modelle sind sich uneinig - verwende Claude mit Verifikation")
-        return False, solve_single_model(ocr_text)
+        return solve_single_model(ocr_text)
 
 # --- UI ---
 uploaded_file = st.file_uploader(
@@ -255,6 +283,10 @@ if uploaded_file is not None:
     with st.spinner("📖 Lese Text..."):
         ocr_text = extract_text_with_gemini(image, file_hash)
     
+    # Debug OCR
+    with st.expander("🔍 OCR-Text"):
+        st.code(ocr_text)
+    
     # Solve Button
     if st.button("🧮 Aufgaben lösen", type="primary"):
         st.markdown("---")
@@ -262,26 +294,34 @@ if uploaded_file is not None:
         try:
             if GPT_MODEL:
                 # Multi-Model Consensus
-                consensus, final_solution = achieve_consensus_multi(ocr_text, GPT_MODEL)
+                final_solution = achieve_consensus_multi(ocr_text, GPT_MODEL)
             else:
                 # Single Model mit Verifikation
                 final_solution = solve_single_model(ocr_text)
             
-            # Zeige Ergebnis
+            # Zeige finale Lösung
+            st.markdown("---")
             st.markdown("### 📊 Lösung:")
-            lines = final_solution.split('\n')
-            for line in lines:
-                if line.strip():
-                    if line.startswith('Aufgabe'):
-                        parts = line.split(':', 1)
-                        if len(parts) == 2:
-                            st.markdown(f"### {parts[0]}: **{parts[1].strip()}**")
-                    elif line.startswith('Begründung:'):
-                        st.markdown(f"*{line}*")
-                        
+            
+            # Parse und zeige Lösung
+            if final_solution:
+                lines = final_solution.split('\n')
+                for line in lines:
+                    if line.strip():
+                        if any(x in line for x in ['Aufgabe', 'AUFGABE', 'Task']):
+                            parts = line.split(':', 1)
+                            if len(parts) == 2:
+                                st.markdown(f"### {parts[0].strip()}: **{parts[1].strip()}**")
+                            else:
+                                st.markdown(f"### {line}")
+                        elif 'Begründung:' in line or 'BEGRÜNDUNG:' in line:
+                            st.markdown(f"*{line.strip()}*")
+                        elif line.strip() and not line.startswith('---'):
+                            st.markdown(line.strip())
+                            
         except Exception as e:
             st.error(f"Fehler: {str(e)}")
-            logger.error(f"Processing error: {str(e)}")
+            logger.error(f"Processing error: {str(e)}", exc_info=True)
 
 # Footer
 model_info = f"Claude 4 Opus + {GPT_MODEL}" if GPT_MODEL else "Claude 4 Opus (Single Model)"
