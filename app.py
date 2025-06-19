@@ -35,7 +35,7 @@ def validate_keys():
 validate_keys()
 
 # --- UI-Einstellungen ---
-st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
+st.set_page_config(layout="centered", page_title="2.0", page_icon=🚀"")
 st.title("🦊 Koifox-Bot")
 st.markdown("*Verbesserte OCR für Graphen und Konsistenzprüfung*")
 
