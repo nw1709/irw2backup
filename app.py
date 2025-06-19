@@ -1,6 +1,6 @@
 import streamlit as st
 from anthropic import Anthropic
-from openai import OpenAI
+from openai
 from PIL import Image
 import google.generativeai as genai
 import logging
