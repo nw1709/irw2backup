@@ -43,6 +43,32 @@ vision_model = genai.GenerativeModel("gemini-1.5-flash")
 claude_client = Anthropic(api_key=st.secrets["claude_key"])
 openai_client = OpenAI(api_key=st.secrets["openai_key"])
 
+# --- Test GPT-4 Verfügbarkeit ---
+@st.cache_data
+def check_gpt4_access():
+    """Prüft welche GPT Modelle verfügbar sind"""
+    try:
+        models = openai_client.models.list()
+        available_models = [m.id for m in models]
+        
+        # Priorisierte Modellauswahl
+        if "gpt-4-turbo" in available_models:
+            return "gpt-4-turbo"
+        elif "gpt-4" in available_models:
+            return "gpt-4"
+        elif any("gpt-4" in m for m in available_models):
+            # Finde irgendein GPT-4 Modell
+            gpt4_models = [m for m in available_models if "gpt-4" in m]
+            return gpt4_models[0]
+        else:
+            # Fallback auf GPT-3.5
+            return "gpt-3.5-turbo"
+    except:
+        return "gpt-3.5-turbo"
+
+GPT_MODEL = check_gpt4_access()
+st.sidebar.info(f"🤖 Verwende: {GPT_MODEL}")
+
 # --- OCR mit Caching ---
 @st.cache_data(ttl=3600)
 def extract_text_with_gemini(_image, file_hash):
@@ -68,7 +94,7 @@ def extract_answers(solution_text):
     
     for i, line in enumerate(lines):
         # Suche nach "Aufgabe X: Y" Pattern
-        match = re.search(r'Aufgabe\s*(\d+)\s*:\s*([A-E,\s]+|\d+)', line, re.IGNORECASE)
+        match = re.search(r'Aufgabe\s*(\d+)\s*:\s*([A-E,\s]+|\d+|[\d,]+)', line, re.IGNORECASE)
         if match:
             task_num = match.group(1)
             answer = match.group(2).strip()
@@ -89,6 +115,7 @@ WICHTIGE DEFINITIONEN:
 - Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
 - Homogenitätsgrad k bedeutet: f(λr) = λ^k·f(r) für ALLE λ
 - "α + β = 3" impliziert NICHT α = β
+- Prüfe IMMER ob die Bedingungen für mathematische Eigenschaften erfüllt sind
 
 ANALYSIERE DIESEN TEXT:
 {ocr_text}
@@ -109,9 +136,9 @@ Begründung: [Kurze Erklärung auf Deutsch]"""
     
     return response.content[0].text
 
-# --- GPT-4 Solver ---
-def solve_with_gpt4(ocr_text, previous_solution=None):
-    """GPT-4 löst die Aufgabe"""
+# --- GPT Solver ---
+def solve_with_gpt(ocr_text, previous_solution=None):
+    """GPT löst die Aufgabe"""
     
     base_prompt = f"""Du bist ein Experte für "Internes Rechnungswesen (31031)" an der Fernuni Hagen.
 
@@ -119,6 +146,7 @@ WICHTIGE DEFINITIONEN:
 - Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
 - Homogenitätsgrad k bedeutet: f(λr) = λ^k·f(r) für ALLE λ
 - "α + β = 3" impliziert NICHT α = β
+- Prüfe IMMER ob die Bedingungen für mathematische Eigenschaften erfüllt sind
 
 ANALYSIERE DIESEN TEXT:
 {ocr_text}
@@ -130,23 +158,28 @@ Begründung: [Kurze Erklärung auf Deutsch]"""
     if previous_solution:
         base_prompt += f"\n\nEIN ANDERES MODELL HAT FOLGENDE LÖSUNG:\n{previous_solution}\n\nPRÜFE DIESE KRITISCH und gib DEINE EIGENE LÖSUNG."
 
-    response = openai_client.chat.completions.create(
-        model="gpt-4-turbo-preview",
-        messages=[
-            {"role": "system", "content": "Du bist ein präziser Mathematik-Experte. Mache keine unbegründeten Annahmen."},
-            {"role": "user", "content": base_prompt}
-        ],
-        max_tokens=2000,
-        temperature=0.1
-    )
-    
-    return response.choices[0].message.content
+    try:
+        response = openai_client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {"role": "system", "content": "Du bist ein präziser Mathematik-Experte. Mache keine unbegründeten Annahmen."},
+                {"role": "user", "content": base_prompt}
+            ],
+            max_tokens=2000,
+            temperature=0.1
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"GPT Error: {str(e)}")
+        st.error(f"GPT Fehler: {str(e)}")
+        raise
 
 # --- Consensus System ---
 def achieve_consensus(ocr_text, max_iterations=3):
-    """Iteratives Consensus-System zwischen Claude und GPT-4"""
+    """Iteratives Consensus-System zwischen Claude und GPT"""
     
     iteration_data = []
+    model_name = "GPT-4" if "gpt-4" in GPT_MODEL else "GPT-3.5"
     
     for iteration in range(max_iterations):
         st.write(f"🔄 Iteration {iteration + 1}/{max_iterations}")
@@ -155,37 +188,37 @@ def achieve_consensus(ocr_text, max_iterations=3):
         if iteration == 0:
             with st.spinner("Claude löst..."):
                 claude_solution = solve_with_claude(ocr_text)
-            with st.spinner("GPT-4 löst..."):
-                gpt4_solution = solve_with_gpt4(ocr_text)
+            with st.spinner(f"{model_name} löst..."):
+                gpt_solution = solve_with_gpt(ocr_text)
         else:
             # Mit gegenseitigem Feedback
-            with st.spinner("Claude überprüft GPT-4's Lösung..."):
-                claude_solution = solve_with_claude(ocr_text, gpt4_solution)
-            with st.spinner("GPT-4 überprüft Claude's Lösung..."):
-                gpt4_solution = solve_with_gpt4(ocr_text, claude_solution)
+            with st.spinner(f"Claude überprüft {model_name}'s Lösung..."):
+                claude_solution = solve_with_claude(ocr_text, gpt_solution)
+            with st.spinner(f"{model_name} überprüft Claude's Lösung..."):
+                gpt_solution = solve_with_gpt(ocr_text, claude_solution)
         
         # Extrahiere Antworten
         claude_answers = extract_answers(claude_solution)
-        gpt4_answers = extract_answers(gpt4_solution)
+        gpt_answers = extract_answers(gpt_solution)
         
         # Speichere Iteration
         iteration_data.append({
             'iteration': iteration + 1,
             'claude': {'full': claude_solution, 'answers': claude_answers},
-            'gpt4': {'full': gpt4_solution, 'answers': gpt4_answers}
+            'gpt': {'full': gpt_solution, 'answers': gpt_answers}
         })
         
         # Vergleiche Antworten
-        all_tasks = set(claude_answers.keys()) | set(gpt4_answers.keys())
+        all_tasks = set(claude_answers.keys()) | set(gpt_answers.keys())
         consensus = True
         
-        for task in all_tasks:
+        for task in sorted(all_tasks):
             claude_ans = claude_answers.get(task, "N/A")
-            gpt4_ans = gpt4_answers.get(task, "N/A")
+            gpt_ans = gpt_answers.get(task, "N/A")
             
-            if claude_ans != gpt4_ans:
+            if claude_ans != gpt_ans:
                 consensus = False
-                st.warning(f"❌ Diskrepanz bei {task}: Claude={claude_ans}, GPT-4={gpt4_ans}")
+                st.warning(f"❌ Diskrepanz bei {task}: Claude={claude_ans}, {model_name}={gpt_ans}")
             else:
                 st.success(f"✅ Konsens bei {task}: {claude_ans}")
         
@@ -193,7 +226,7 @@ def achieve_consensus(ocr_text, max_iterations=3):
             st.success(f"🎉 Konsens erreicht nach {iteration + 1} Iteration(en)!")
             return True, iteration_data
     
-    st.error("❌ Kein Konsens nach maximalen Iterationen erreicht")
+    st.error(f"❌ Kein Konsens nach {max_iterations} Iterationen")
     return False, iteration_data
 
 # --- UI ---
@@ -225,57 +258,62 @@ if uploaded_file is not None:
         st.markdown("---")
         st.markdown("### 🤝 Consensus-Prozess:")
         
-        # Consensus erreichen
-        consensus_reached, iterations = achieve_consensus(ocr_text)
-        
-        # Ergebnisse anzeigen
-        st.markdown("---")
-        st.markdown("### 📊 Finale Lösung:")
-        
-        if consensus_reached:
-            # Zeige finale übereinstimmende Lösung
-            final_iteration = iterations[-1]
-            final_answers = final_iteration['claude']['answers']
+        try:
+            # Consensus erreichen
+            consensus_reached, iterations = achieve_consensus(ocr_text)
             
-            for task, answer in sorted(final_answers.items()):
-                st.markdown(f"### {task}: **{answer}**")
+            # Ergebnisse anzeigen
+            st.markdown("---")
+            st.markdown("### 📊 Finale Lösung:")
             
-            # Zeige Begründungen
-            with st.expander("Begründungen"):
-                st.markdown("**Claude's Begründung:**")
-                st.code(final_iteration['claude']['full'])
-                st.markdown("**GPT-4's Begründung:**")
-                st.code(final_iteration['gpt4']['full'])
-        else:
-            st.error("Keine eindeutige Lösung - bitte manuell prüfen!")
+            if consensus_reached:
+                # Zeige finale übereinstimmende Lösung
+                final_iteration = iterations[-1]
+                final_answers = final_iteration['claude']['answers']
+                
+                for task, answer in sorted(final_answers.items()):
+                    st.markdown(f"### {task}: **{answer}**")
+                
+                # Zeige Begründungen
+                with st.expander("Begründungen"):
+                    st.markdown("**Claude's Begründung:**")
+                    st.code(final_iteration['claude']['full'])
+                    st.markdown(f"**{GPT_MODEL}'s Begründung:**")
+                    st.code(final_iteration['gpt']['full'])
+            else:
+                st.error("Keine eindeutige Lösung - bitte manuell prüfen!")
+                
+                # Zeige beide finalen Lösungen
+                final_iteration = iterations[-1]
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("**Claude's finale Lösung:**")
+                    for task, answer in final_iteration['claude']['answers'].items():
+                        st.markdown(f"{task}: **{answer}**")
+                        
+                with col2:
+                    st.markdown(f"**{GPT_MODEL}'s finale Lösung:**")
+                    for task, answer in final_iteration['gpt']['answers'].items():
+                        st.markdown(f"{task}: **{answer}**")
             
-            # Zeige beide finalen Lösungen
-            final_iteration = iterations[-1]
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("**Claude's finale Lösung:**")
-                for task, answer in final_iteration['claude']['answers'].items():
-                    st.markdown(f"{task}: **{answer}**")
-                    
-            with col2:
-                st.markdown("**GPT-4's finale Lösung:**")
-                for task, answer in final_iteration['gpt4']['answers'].items():
-                    st.markdown(f"{task}: **{answer}**")
-        
-        # Zeige alle Iterationen wenn gewünscht
-        if show_all_iterations:
-            with st.expander("🔄 Alle Iterationen"):
-                for iter_data in iterations:
-                    st.markdown(f"**Iteration {iter_data['iteration']}:**")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("Claude:")
-                        st.json(iter_data['claude']['answers'])
-                    with col2:
-                        st.markdown("GPT-4:")
-                        st.json(iter_data['gpt4']['answers'])
+            # Zeige alle Iterationen wenn gewünscht
+            if show_all_iterations:
+                with st.expander("🔄 Alle Iterationen"):
+                    for iter_data in iterations:
+                        st.markdown(f"**Iteration {iter_data['iteration']}:**")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("Claude:")
+                            st.json(iter_data['claude']['answers'])
+                        with col2:
+                            st.markdown(f"{GPT_MODEL}:")
+                            st.json(iter_data['gpt']['answers'])
+                            
+        except Exception as e:
+            st.error(f"Fehler während der Verarbeitung: {str(e)}")
+            logger.error(f"Processing error: {str(e)}")
 
 # Footer
 st.markdown("---")
-st.caption("Multi-Model Consensus System | Claude 4 Opus + GPT-4 Turbo")
+st.caption(f"Multi-Model Consensus System | Claude 4 Opus + {GPT_MODEL}")
