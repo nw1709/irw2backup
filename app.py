@@ -37,7 +37,7 @@ validate_keys()
 # --- UI-Einstellungen ---
 st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
 st.title("🦊 Koifox-Bot")
-st.markdown("*Verbesserte OCR Version mit Chain-of-Thought und Konsistenzprüfung*")
+st.markdown("*Verbesserte OCR für Graphen und Konsistenzprüfung*")
 
 # --- Gemini Flash Konfiguration ---
 genai.configure(api_key=st.secrets["gemini_key"])
@@ -50,10 +50,10 @@ def load_sentence_transformer():
 
 sentence_model = load_sentence_transformer()
 
-# --- Verbesserte OCR ---
+# --- Verbesserte OCR mit Graphenbeschreibung ---
 @st.cache_data(ttl=3600)
 def extract_text_with_gemini_improved(_image, file_hash):
-    """Extrahiert KOMPLETTEN Text aus Bild"""
+    """Extrahiert KOMPLETTEN Text und beschreibt Graphen"""
     try:
         logger.info(f"Starting GEMINI OCR for file hash: {file_hash}")
         
@@ -63,22 +63,30 @@ def extract_text_with_gemini_improved(_image, file_hash):
             _image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             st.sidebar.warning(f"Bild wurde auf {max_size}px skaliert")
         
-        # Strukturierter OCR Prompt
+        # Strukturierter OCR Prompt mit Graphenbeschreibung
         response = vision_model.generate_content(
             [
-                """Extract ALL text from this exam image in a structured format.
+                """Extract ALL content from this exam image in a structured format, including text, formulas, and visual elements like graphs, diagrams, or tables.
+
                 IMPORTANT:
-                - Read EVERYTHING from top to bottom
+                - Read ALL text from top to bottom, including:
+                  - Question numbers (e.g., "Aufgabe 45 (5 RP)")
+                  - All questions, formulas, values, and answer options (A, B, C, D, E) with their complete text
+                  - Mathematical symbols and formulas exactly as shown (e.g., f(r₁,r₂) = (r₁^α + r₂^β)^γ)
+                - For graphs, diagrams, or tables:
+                  - Describe the visual elements in detail, including:
+                    - Axes labels (e.g., x-axis: "Quantity", y-axis: "Cost")
+                    - Data points or values shown (e.g., "Point at (10, 500)")
+                    - Curve shapes or trends (e.g., "Linear increasing curve")
+                    - Any annotations or labels in the graph
+                  - If a table is present, extract it as a structured table (e.g., rows and columns)
                 - Structure the output as follows:
                   - Aufgabe [Nummer]: [Fragetext]
                     - Option A: [Text]
                     - Option B: [Text]
                     - ...
                     - Formeln: [z. B. f(r₁,r₂) = (r₁^α + r₂^β)^γ]
-                - Include ALL questions, formulas, values, and answer options
-                - Include question numbers like "Aufgabe 45 (5 RP)"
-                - Include ALL multiple choice options (A, B, C, D, E) with their complete text
-                - Include mathematical symbols and formulas exactly as shown
+                    - Graph/Table: [Detailed description]
                 - DO NOT summarize or skip any part
                 - DO NOT solve anything
                 
@@ -87,7 +95,7 @@ def extract_text_with_gemini_improved(_image, file_hash):
             ],
             generation_config={
                 "temperature": 0,
-                "max_output_tokens": 8000
+                "max_output_tokens": 10000  # Erhöht für Graphenbeschreibungen
             }
         )
         
@@ -95,7 +103,11 @@ def extract_text_with_gemini_improved(_image, file_hash):
         
         # Prüfe ob genug Text extrahiert wurde
         if len(ocr_result) < 500:
-            st.warning(f"⚠️ Nur {len(ocr_result)} Zeichen extrahiert - möglicherweise unvollständig!")
+            st.warning(f"⚠️ Nur {len(ocr_result)} Zeichen extrahiert - möglicherweise unvollständig! Überprüfe, ob Graphen/Diagramme erkannt wurden.")
+        
+        # Prüfe auf Graphenbeschreibungen
+        if "Graph:" not in ocr_result and "Table:" not in ocr_result:
+            st.warning("⚠️ Keine Graphen oder Tabellen im OCR-Text gefunden. Möglicherweise wurden visuelle Elemente nicht erkannt.")
         
         logger.info(f"GEMINI OCR completed: {len(ocr_result)} characters")
         return ocr_result
@@ -111,9 +123,9 @@ def are_answers_similar(answer1, answer2):
         embeddings = sentence_model.encode([answer1, answer2])
         similarity = util.cos_sim(embeddings[0], embeddings[1]).item()
         logger.info(f"Antwortähnlichkeit: {similarity:.2f}")
-        return similarity > 0.9
+        return similarity > 0.8  # Schwellenwert gesenkt
     except Exception as e:
-        logger.error(f"Konsistenzprüfung fehlgeschlagengypten: {str(e)}")
+        logger.error(f"Konsistenzprüfung fehlgeschlagen: {str(e)}")
         return False
 
 # --- Claude Solver mit Chain-of-Thought ---
@@ -131,15 +143,18 @@ WICHTIGE REGELN:
 3. Beantworte JEDE Aufgabe die du findest
 4. Denke schrittweise:
    - Lies die Aufgabe sorgfältig
-   - Identifiziere alle relevanten Formeln und Werte
+   - Identifiziere alle relevanten Formeln, Werte und visuelle Daten (z.B. Graphenbeschreibungen)
+   - Wenn Daten unvollständig sind, dokumentiere Annahmen klar
    - Führe die Berechnung explizit durch
    - Überprüfe dein Ergebnis
 5. Bei Multiple-Choice-Fragen: Analysiere jede Option und begründe, warum sie richtig oder falsch ist
+6. Wenn Graphen oder Tabellen beschrieben sind, nutze diese Informationen für die Lösung
 
 AUSGABEFORMAT (STRIKT EINHALTEN):
 Aufgabe [Nummer]: [Antwort]
 Begründung: [Schritt-für-Schritt-Erklärung]
 Berechnung: [Mathematische Schritte]
+Annahmen (falls nötig): [z.B. "Fehlende Datenpunkte im Graphen wurden als linear angenommen"]
 
 Wiederhole dies für JEDE Aufgabe im Text.
 
@@ -147,10 +162,12 @@ Beispiel:
 Aufgabe 45: 500
 Begründung: Der Parameter a entspricht dem Achsenabschnitt bei p = 0, also a = 500.
 Berechnung: a = f(0) = 500
+Annahmen: Keine
 
 Aufgabe 46: b
 Begründung: Um Parameter b zu bestimmen...
 Berechnung: b = (f(1) - f(0)) / x
+Annahmen: Linearer Kurvenverlauf basierend auf Graphenbeschreibung
 
 WICHTIG: Vergiss keine Aufgabe!"""
 
@@ -180,15 +197,18 @@ WICHTIGE REGELN:
 3. Beantworte JEDE Aufgabe die du findest
 4. Denke schrittweise:
    - Lies die Aufgabe sorgfältig
-   - Identifiziere alle relevanten Formeln und Werte
+   - Identifiziere alle relevanten Formeln, Werte und visuelle Daten (z.B. Graphenbeschreibungen)
+   - Wenn Daten unvollständig sind, dokumentiere Annahmen klar
    - Führe die Berechnung explizit durch
    - Überprüfe dein Ergebnis
 5. Bei Multiple-Choice-Fragen: Analysiere jede Option und begründe, warum sie richtig oder falsch ist
+6. Wenn Graphen oder Tabellen beschrieben sind, nutze diese Informationen für die Lösung
 
 AUSGABEFORMAT (STRIKT EINHALTEN):
 Aufgabe [Nummer]: [Antwort]
 Begründung: [Schritt-für-Schritt-Erklärung]
 Berechnung: [Mathematische Schritte]
+Annahmen (falls nötig): [z.B. "Fehlende Datenpunkte im Graphen wurden als linear angenommen"]
 
 Wiederhole dies für JEDE Aufgabe im Text."""
 
@@ -222,14 +242,16 @@ def parse_and_display_solution(solution_text, model_name="Claude"):
     for task_num, answer in tasks:
         st.markdown(f"### Aufgabe {task_num}: **{answer.strip()}** ({model_name})")
         
-        # Finde zugehörige Begründung und Berechnung
-        begr_pattern = rf'Aufgabe\s+{task_num}\s*:.*?\n\s*Begründung:\s*([^\n]+(?:\n(?!Aufgabe)[^\n]+)*?)(?:\n\s*Berechnung:\s*([^\n]+(?:\n(?!Aufgabe)[^\n]+)*))?(?=\n\s*Aufgabe|\Z)'
+        # Finde zugehörige Begründung, Berechnung und Annahmen
+        begr_pattern = rf'Aufgabe\s+{task_num}\s*:.*?\n\s*Begründung:\s*([^\n]+(?:\n(?!Aufgabe)[^\n]+)*?)(?:\n\s*Berechnung:\s*([^\n]+(?:\n(?!Aufgabe)[^\n]+)*))?(?:\n\s*Annahmen\s*\(falls\s*nötig\):\s*([^\n]+(?:\n(?!Aufgabe)[^\n]+)*))?(?=\n\s*Aufgabe|\Z)'
         begr_match = re.search(begr_pattern, solution_text, re.IGNORECASE | re.DOTALL)
         
         if begr_match:
             st.markdown(f"*Begründung: {begr_match.group(1).strip()}*")
             if begr_match.group(2):
                 st.markdown(f"*Berechnung: {begr_match.group(2).strip()}*")
+            if begr_match.group(3):
+                st.markdown(f"*Annahmen: {begr_match.group(3).strip()}*")
         
         st.markdown("---")
 
@@ -258,7 +280,7 @@ if uploaded_file is not None:
         st.image(image, caption=f"Originalbild ({image.width}x{image.height}px)", use_container_width=True)
         
         # OCR
-        with st.spinner("📖 Lese KOMPLETTEN Text mit Gemini..."):
+        with st.spinner("📖 Lese KOMPLETTEN Text und Graphen mit Gemini..."):
             ocr_text = extract_text_with_gemini_improved(image, file_hash)
         
         # OCR Ergebnis
@@ -271,6 +293,10 @@ if uploaded_file is not None:
                 st.success(f"✅ Gefundene Aufgaben: {', '.join(found_tasks)}")
             else:
                 st.error("❌ Keine Aufgaben im Text gefunden!")
+            
+            # Prüfe auf Graphenbeschreibungen
+            if "Graph:" in ocr_text or "Table:" in ocr_text:
+                st.success("✅ Graphen oder Tabellen im OCR-Text gefunden!")
         
         # Lösen
         if st.button("🧮 Alle Aufgaben lösen", type="primary"):
@@ -304,4 +330,4 @@ if uploaded_file is not None:
 
 # --- Footer ---
 st.markdown("---")
-st.caption("Koifox-Bot | Verbesserte OCR, Chain-of-Thought & Konsistenzprüfung")
+st.caption("Koifox-Bot | Verbesserte OCR für Graphen, Chain-of-Thought & Konsistenzprüfung")
