@@ -91,35 +91,6 @@ def load_knowledge_from_drive():
         logger.error(f"Drive-Fehler: {str(e)}")
         return knowledge_base
 
-# --- Bildvorverarbeitung wie Scanner-App ---
-def preprocess_image_like_scanner(image):
-    """Simuliert Scanner-App Vorverarbeitung für bessere Lesbarkeit und kleinere Dateien"""
-    try:
-        # PIL zu OpenCV
-        img_array = np.array(image)
-        
-        # Zu Graustufen konvertieren
-        if len(img_array.shape) == 3:
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = img_array
-        
-        # Kontrast erhöhen
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        
-        # Rauschen entfernen
-        denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
-        
-        # Adaptive Schwellwertbildung für Text
-        binary = cv2.adaptiveThreshold(
-            denoised, 255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
-        )
-        
-        # Zurück zu PIL
-        processed = Image.fromarray(binary)
         
         # Größe optimieren (max 2048px bei Beibehaltung des Seitenverhältnisses)
         processed.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
