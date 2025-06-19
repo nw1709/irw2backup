@@ -116,4 +116,88 @@ def call_claude_or_fallback(prompt):
 
 # --- UI Optionen ---
 debug_mode = st.checkbox("🔍 Debug-Modus", value=False, help="Zeigt OCR-Ergebnis und Details")
-usermode_gpt = st.checkbox("🧠 GPT-4 Turbo stattdessen verwenden", valu_
+usermode_gpt = st.checkbox("🧠 GPT-4 Turbo stattdessen verwenden", value=False, help="Nutzt GPT-4 direkt, z. B. für zweite Meinung oder wenn Claude down ist")
+
+# --- Datei-Upload ---
+uploaded_file = st.file_uploader(
+    "**Klausuraufgabe hochladen...**",
+    type=["png", "jpg", "jpeg"],
+    key="file_uploader"
+)
+
+if uploaded_file is not None:
+    try:
+        file_bytes = uploaded_file.getvalue()
+        file_hash = hashlib.md5(file_bytes).hexdigest()
+
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Hochgeladene Klausuraufgabe", use_container_width=True)
+
+        with st.spinner("Lese Text mit Gemini Flash..."):
+            ocr_text = extract_text_with_gemini(image, file_hash)
+
+        if debug_mode:
+            with st.expander("🔍 OCR-Ergebnis", expanded=False):
+                st.code(ocr_text)
+                st.info(f"File Hash: {file_hash[:8]}... (für Caching)")
+
+        if st.button("🧮 Aufgaben lösen", type="primary"):
+            header = load_prompt_header()
+            prompt = f"""{header}
+
+OCR-TEXT START:
+{ocr_text}
+OCR-TEXT ENDE
+
+KRITISCHE ANWEISUNGEN:
+1. Lies die Aufgabe SEHR sorgfältig
+2. Bei Rechenaufgaben:
+   - Zeige JEDEN Rechenschritt
+   - Prüfe dein Ergebnis nochmal
+3. Bei Multiple Choice: Prüfe jede Option einzeln
+4. VERIFIZIERE deine Antwort bevor du antwortest
+5. Stelle SICHER, dass deine Antwort mit deiner Analyse übereinstimmt!
+
+FORMAT - WICHTIG:
+Aufgabe [Nr]: [NUR die finale Antwort - Zahl oder Buchstabe(n)]
+Begründung: [1 Satz auf Deutsch]
+"""
+
+            if debug_mode:
+                with st.expander("🔍 Claude Prompt", expanded=False):
+                    st.code(prompt)
+
+            with st.spinner("Löse Aufgabe..."):
+                if usermode_gpt:
+                    result, claude_failed = call_gpt4_fallback(prompt)
+                else:
+                    result, claude_failed = call_claude_or_fallback(prompt)
+
+            st.markdown("---")
+            st.markdown("### Lösung:")
+
+            lines = result.split('\n')
+            for line in lines:
+                if line.strip():
+                    if line.startswith('Aufgabe'):
+                        parts = line.split(':', 1)
+                        if len(parts) == 2:
+                            st.markdown(f"### {parts[0]}: **{parts[1].strip()}**")
+                        else:
+                            st.markdown(f"### {line}")
+                    elif line.startswith('Begründung:'):
+                        st.markdown(f"*{line}*")
+                    else:
+                        st.markdown(line)
+
+            if claude_failed and not usermode_gpt:
+                st.warning("Claude war aktuell nicht erreichbar. Die Antwort wurde stattdessen von GPT-4 Turbo erstellt. Versuche es später erneut, wenn du Claude bevorzugst.")
+
+            st.info("💡 OCR-Ergebnisse werden gecached, Lösungen werden immer neu berechnet.")
+
+    except Exception as e:
+        logger.error(f"General error: {str(e)}")
+        st.error(f"❌ Fehler: {str(e)}")
+
+st.markdown("---")
+st.caption("Made by Fox | OCR cached, Solutions always fresh")
