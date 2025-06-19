@@ -6,6 +6,7 @@ import logging
 import hashlib
 import re
 import time
+import io  # FEHLTE!
 
 # --- Logger Setup ---
 logging.basicConfig(
@@ -320,6 +321,3 @@ else:
 # Footer
 st.markdown("---")
 st.caption("Koifox-Bot v4.0 | Optimized for reliability")
-
-# Add missing import
-import io
