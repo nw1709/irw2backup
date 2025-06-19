@@ -1,10 +1,11 @@
 import streamlit as st
 from anthropic import Anthropic
+from openai import OpenAI
 from PIL import Image
 import google.generativeai as genai
 import logging
 import hashlib
-import json
+import re
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -14,19 +15,19 @@ logger = logging.getLogger(__name__)
 def validate_keys():
     required_keys = {
         'gemini_key': ('AIza', "Gemini"),
-        'claude_key': ('sk-ant', "Claude")
+        'claude_key': ('sk-ant', "Claude"),
+        'openai_key': ('sk-', "OpenAI")
     }
     missing = []
-    invalid = []
     
     for key, (prefix, name) in required_keys.items():
         if key not in st.secrets:
             missing.append(name)
         elif not st.secrets[key].startswith(prefix):
-            invalid.append(name)
+            missing.append(f"{name} (invalid)")
     
-    if missing or invalid:
-        st.error(f"API Key Problem: Missing {', '.join(missing)} | Invalid {', '.join(invalid)}")
+    if missing:
+        st.error(f"Fehlende API Keys: {', '.join(missing)}")
         st.stop()
 
 validate_keys()
@@ -34,199 +35,247 @@ validate_keys()
 # --- UI-Einstellungen ---
 st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
 st.title("🦊 Koifox-Bot")
-st.markdown("*Made with coffee, deep minimal and tiny gummy bears*")
+st.markdown("*Multi-Model Consensus System für maximale Genauigkeit*")
 
-# --- Cache Management ---
-col1, col2 = st.columns([3, 1])
-with col2:
-    if st.button("🗑️ Cache leeren", type="secondary", help="Löscht gespeicherte OCR-Ergebnisse"):
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        st.rerun()
-
-# --- Gemini Flash Konfiguration ---
+# --- API Clients ---
 genai.configure(api_key=st.secrets["gemini_key"])
 vision_model = genai.GenerativeModel("gemini-1.5-flash")
+claude_client = Anthropic(api_key=st.secrets["claude_key"])
+openai_client = OpenAI(api_key=st.secrets["openai_key"])
 
 # --- OCR mit Caching ---
 @st.cache_data(ttl=3600)
 def extract_text_with_gemini(_image, file_hash):
-    """Extrahiert Text aus Bild - gecached basierend auf file_hash"""
+    """Extrahiert Text aus Bild"""
     try:
-        logger.info(f"Starting OCR for file hash: {file_hash}")
         response = vision_model.generate_content(
             [
-                "Extract ALL text from this exam image EXACTLY as written. Include all question numbers, text, and answer options (A, B, C, D, E). Do NOT interpret or solve.",
+                "Extract ALL text from this exam image EXACTLY as written. Include all question numbers, text, and answer options. Do NOT interpret.",
                 _image
             ],
-            generation_config={
-                "temperature": 0,
-                "max_output_tokens": 4000
-            }
+            generation_config={"temperature": 0, "max_output_tokens": 4000}
         )
-        logger.info("OCR completed successfully")
         return response.text.strip()
     except Exception as e:
         logger.error(f"Gemini OCR Error: {str(e)}")
         raise e
 
-# --- NEUE FUNKTION: Doppelte Verifizierung ---
-def verify_solution(ocr_text, first_solution):
-    """Verifiziert die erste Lösung durch eine zweite, unabhängige Analyse"""
-    verify_prompt = f"""Du bist ein ZWEITER Experte der die Lösung eines Kollegen überprüft.
+# --- Lösungsextraktion ---
+def extract_answers(solution_text):
+    """Extrahiert strukturierte Antworten aus Lösungstext"""
+    answers = {}
+    lines = solution_text.split('\n')
+    
+    for i, line in enumerate(lines):
+        # Suche nach "Aufgabe X: Y" Pattern
+        match = re.search(r'Aufgabe\s*(\d+)\s*:\s*([A-E,\s]+|\d+)', line, re.IGNORECASE)
+        if match:
+            task_num = match.group(1)
+            answer = match.group(2).strip()
+            # Normalisiere Multiple-Choice Antworten
+            if any(letter in answer for letter in 'ABCDE'):
+                answer = ''.join(sorted(c for c in answer.upper() if c in 'ABCDE'))
+            answers[f"Aufgabe {task_num}"] = answer
+    
+    return answers
 
-AUFGABENTEXT:
+# --- Claude Solver ---
+def solve_with_claude(ocr_text, previous_solution=None):
+    """Claude löst die Aufgabe"""
+    
+    base_prompt = f"""Du bist ein Experte für "Internes Rechnungswesen (31031)" an der Fernuni Hagen.
+
+WICHTIGE DEFINITIONEN:
+- Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
+- Homogenitätsgrad k bedeutet: f(λr) = λ^k·f(r) für ALLE λ
+- "α + β = 3" impliziert NICHT α = β
+
+ANALYSIERE DIESEN TEXT:
 {ocr_text}
 
-ERSTE LÖSUNG:
-{first_solution}
+FORMAT:
+Aufgabe [Nr]: [Antwort - nur Buchstaben oder Zahl]
+Begründung: [Kurze Erklärung auf Deutsch]"""
 
-DEINE AUFGABE:
-1. Löse die Aufgabe KOMPLETT NEU und UNABHÄNGIG
-2. Vergleiche deine Lösung mit der ersten Lösung
-3. Bei Unstimmigkeiten: Erkläre genau wo der Fehler liegt
+    if previous_solution:
+        base_prompt += f"\n\nEIN ANDERES MODELL HAT FOLGENDE LÖSUNG:\n{previous_solution}\n\nPRÜFE DIESE KRITISCH und gib DEINE EIGENE LÖSUNG."
 
-WICHTIGE PRÜFPUNKTE:
-- Bei Homogenität: Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
-- Wenn nur α + β gegeben ist (nicht α = β), ist die Funktion i.A. NICHT homogen
-- Prüfe JEDE mathematische Schlussfolgerung kritisch
-- Hinterfrage Annahmen die nicht explizit gegeben sind
-
-Antworte im Format:
-VERIFIKATION: [BESTÄTIGT/FEHLER GEFUNDEN]
-KORREKTE LÖSUNG: [Aufgabe X: Antwort]
-ERKLÄRUNG: [Warum die Lösung richtig/falsch ist]"""
-
-    client = Anthropic(api_key=st.secrets["claude_key"])
-    response = client.messages.create(
+    response = claude_client.messages.create(
         model="claude-4-opus-20250514",
         max_tokens=2000,
-        temperature=0.3,  # Etwas höher für kritisches Denken
-        messages=[{"role": "user", "content": verify_prompt}]
+        temperature=0.1,
+        messages=[{"role": "user", "content": base_prompt}]
     )
     
     return response.content[0].text
 
-# --- UI Optionen ---
-col1, col2 = st.columns([1, 1])
-with col1:
-    debug_mode = st.checkbox("🔍 Debug-Modus", value=False)
-with col2:
-    double_check = st.checkbox("✅ Doppelte Verifizierung", value=True, help="Empfohlen für maximale Genauigkeit")
+# --- GPT-4 Solver ---
+def solve_with_gpt4(ocr_text, previous_solution=None):
+    """GPT-4 löst die Aufgabe"""
+    
+    base_prompt = f"""Du bist ein Experte für "Internes Rechnungswesen (31031)" an der Fernuni Hagen.
 
-# --- Datei-Upload ---
+WICHTIGE DEFINITIONEN:
+- Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
+- Homogenitätsgrad k bedeutet: f(λr) = λ^k·f(r) für ALLE λ
+- "α + β = 3" impliziert NICHT α = β
+
+ANALYSIERE DIESEN TEXT:
+{ocr_text}
+
+FORMAT:
+Aufgabe [Nr]: [Antwort - nur Buchstaben oder Zahl]
+Begründung: [Kurze Erklärung auf Deutsch]"""
+
+    if previous_solution:
+        base_prompt += f"\n\nEIN ANDERES MODELL HAT FOLGENDE LÖSUNG:\n{previous_solution}\n\nPRÜFE DIESE KRITISCH und gib DEINE EIGENE LÖSUNG."
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4-turbo-preview",
+        messages=[
+            {"role": "system", "content": "Du bist ein präziser Mathematik-Experte. Mache keine unbegründeten Annahmen."},
+            {"role": "user", "content": base_prompt}
+        ],
+        max_tokens=2000,
+        temperature=0.1
+    )
+    
+    return response.choices[0].message.content
+
+# --- Consensus System ---
+def achieve_consensus(ocr_text, max_iterations=3):
+    """Iteratives Consensus-System zwischen Claude und GPT-4"""
+    
+    iteration_data = []
+    
+    for iteration in range(max_iterations):
+        st.write(f"🔄 Iteration {iteration + 1}/{max_iterations}")
+        
+        # Erste Lösungen oder mit Feedback
+        if iteration == 0:
+            with st.spinner("Claude löst..."):
+                claude_solution = solve_with_claude(ocr_text)
+            with st.spinner("GPT-4 löst..."):
+                gpt4_solution = solve_with_gpt4(ocr_text)
+        else:
+            # Mit gegenseitigem Feedback
+            with st.spinner("Claude überprüft GPT-4's Lösung..."):
+                claude_solution = solve_with_claude(ocr_text, gpt4_solution)
+            with st.spinner("GPT-4 überprüft Claude's Lösung..."):
+                gpt4_solution = solve_with_gpt4(ocr_text, claude_solution)
+        
+        # Extrahiere Antworten
+        claude_answers = extract_answers(claude_solution)
+        gpt4_answers = extract_answers(gpt4_solution)
+        
+        # Speichere Iteration
+        iteration_data.append({
+            'iteration': iteration + 1,
+            'claude': {'full': claude_solution, 'answers': claude_answers},
+            'gpt4': {'full': gpt4_solution, 'answers': gpt4_answers}
+        })
+        
+        # Vergleiche Antworten
+        all_tasks = set(claude_answers.keys()) | set(gpt4_answers.keys())
+        consensus = True
+        
+        for task in all_tasks:
+            claude_ans = claude_answers.get(task, "N/A")
+            gpt4_ans = gpt4_answers.get(task, "N/A")
+            
+            if claude_ans != gpt4_ans:
+                consensus = False
+                st.warning(f"❌ Diskrepanz bei {task}: Claude={claude_ans}, GPT-4={gpt4_ans}")
+            else:
+                st.success(f"✅ Konsens bei {task}: {claude_ans}")
+        
+        if consensus:
+            st.success(f"🎉 Konsens erreicht nach {iteration + 1} Iteration(en)!")
+            return True, iteration_data
+    
+    st.error("❌ Kein Konsens nach maximalen Iterationen erreicht")
+    return False, iteration_data
+
+# --- UI ---
+debug_mode = st.checkbox("🔍 Debug-Modus", value=False)
+show_all_iterations = st.checkbox("📊 Alle Iterationen anzeigen", value=False)
+
+# Datei-Upload
 uploaded_file = st.file_uploader(
     "**Klausuraufgabe hochladen...**",
-    type=["png", "jpg", "jpeg"],
-    key="file_uploader"
+    type=["png", "jpg", "jpeg"]
 )
 
 if uploaded_file is not None:
-    try:
-        # Eindeutiger Hash für die Datei
-        file_bytes = uploaded_file.getvalue()
-        file_hash = hashlib.md5(file_bytes).hexdigest()
+    # Bild anzeigen
+    image = Image.open(uploaded_file)
+    st.image(image, caption="Hochgeladene Klausuraufgabe", use_container_width=True)
+    
+    # OCR
+    file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest()
+    with st.spinner("📖 Lese Text..."):
+        ocr_text = extract_text_with_gemini(image, file_hash)
+    
+    if debug_mode:
+        with st.expander("OCR-Text"):
+            st.code(ocr_text)
+    
+    # Solve Button
+    if st.button("🧮 Mit Multi-Model Consensus lösen", type="primary"):
+        st.markdown("---")
+        st.markdown("### 🤝 Consensus-Prozess:")
         
-        # Bild laden und anzeigen
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Hochgeladene Klausuraufgabe", use_container_width=True)
+        # Consensus erreichen
+        consensus_reached, iterations = achieve_consensus(ocr_text)
         
-        # OCR (gecached)
-        with st.spinner("Lese Text mit Gemini Flash..."):
-            ocr_text = extract_text_with_gemini(image, file_hash)
-            
-        # Debug: OCR-Ergebnis anzeigen
-        if debug_mode:
-            with st.expander("🔍 OCR-Ergebnis", expanded=False):
-                st.code(ocr_text)
+        # Ergebnisse anzeigen
+        st.markdown("---")
+        st.markdown("### 📊 Finale Lösung:")
         
-        # Button zum Lösen
-        if st.button("🧮 Aufgaben lösen", type="primary"):
+        if consensus_reached:
+            # Zeige finale übereinstimmende Lösung
+            final_iteration = iterations[-1]
+            final_answers = final_iteration['claude']['answers']
             
-            # NEUER PROMPT mit expliziten Fallstricken
-            prompt = f"""You are an expert in "Internes Rechnungswesen (31031)" at Fernuniversität Hagen.
-
-MATHEMATICAL RIGOR RULES:
-1. A function is homogeneous of degree k if f(λr) = λ^k·f(r) for ALL λ and ALL valid inputs
-2. For f(r₁,r₂) = (r₁^α + r₂^β)^γ to be homogeneous, you MUST be able to factor out λ completely
-3. This is ONLY possible if α = β. If α ≠ β, the function is NOT homogeneous
-4. NEVER assume α = β unless explicitly stated
-5. "α + β = 3" does NOT imply α = β
-
-ANALYZE THIS TEXT:
-{ocr_text}
-
-SYSTEMATIC APPROACH:
-Step 1: Identify what is GIVEN (write it down)
-Step 2: Identify what is ASKED (write it down)
-Step 3: Apply definitions RIGOROUSLY
-Step 4: Check each answer option against your analysis
-Step 5: Select ONLY options that are mathematically correct
-
-Think step by step. Show your work. Question your assumptions.
-
-FORMAT:
-Aufgabe [Nr]: [Answer]
-Begründung: [Explanation in German]"""
+            for task, answer in sorted(final_answers.items()):
+                st.markdown(f"### {task}: **{answer}**")
             
-            # Erste Lösung
-            with st.spinner("Löse Aufgabe (Schritt 1/2)..."):
-                client = Anthropic(api_key=st.secrets["claude_key"])
-                
-                response = client.messages.create(
-                    model="claude-4-opus-20250514",
-                    max_tokens=4000,
-                    temperature=0.2,
-                    top_p=0.95,
-                    system="You are a rigorous mathematician. Never make unjustified assumptions. If a property requires specific conditions, verify they are met.",
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                
-                first_solution = response.content[0].text
+            # Zeige Begründungen
+            with st.expander("Begründungen"):
+                st.markdown("**Claude's Begründung:**")
+                st.code(final_iteration['claude']['full'])
+                st.markdown("**GPT-4's Begründung:**")
+                st.code(final_iteration['gpt4']['full'])
+        else:
+            st.error("Keine eindeutige Lösung - bitte manuell prüfen!")
             
-            # Doppelte Verifizierung wenn aktiviert
-            if double_check:
-                with st.spinner("Verifiziere Lösung (Schritt 2/2)..."):
-                    verification = verify_solution(ocr_text, first_solution)
+            # Zeige beide finalen Lösungen
+            final_iteration = iterations[-1]
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Claude's finale Lösung:**")
+                for task, answer in final_iteration['claude']['answers'].items():
+                    st.markdown(f"{task}: **{answer}**")
                     
-                    if debug_mode:
-                        with st.expander("🔍 Verifizierungsergebnis"):
-                            st.code(verification)
-                    
-                    # Finale Lösung basierend auf Verifizierung
-                    if "FEHLER GEFUNDEN" in verification:
-                        st.warning("⚠️ Inkonsistenz entdeckt - verwende verifizierte Lösung")
-                        # Extrahiere korrekte Lösung aus Verifizierung
-                        final_solution = verification
-                    else:
-                        final_solution = first_solution
-            else:
-                final_solution = first_solution
-            
-            # Ergebnisse anzeigen
-            st.markdown("---")
-            st.markdown("### Lösung:")
-            
-            # Parse die finale Lösung
-            lines = final_solution.split('\n')
-            for line in lines:
-                if line.strip():
-                    if line.startswith('Aufgabe') or line.startswith('KORREKTE LÖSUNG:'):
-                        parts = line.split(':', 1)
-                        if len(parts) == 2:
-                            st.markdown(f"### {parts[0]}: **{parts[1].strip()}**")
-                    elif line.startswith('Begründung:') or line.startswith('ERKLÄRUNG:'):
-                        st.markdown(f"*{line}*")
-                    elif line.startswith('VERIFIKATION:'):
-                        if "BESTÄTIGT" in line:
-                            st.success("✅ Lösung wurde verifiziert")
-                        else:
-                            st.info("ℹ️ Lösung wurde korrigiert")
-                    
-    except Exception as e:
-        logger.error(f"General error: {str(e)}")
-        st.error(f"❌ Fehler: {str(e)}")
+            with col2:
+                st.markdown("**GPT-4's finale Lösung:**")
+                for task, answer in final_iteration['gpt4']['answers'].items():
+                    st.markdown(f"{task}: **{answer}**")
+        
+        # Zeige alle Iterationen wenn gewünscht
+        if show_all_iterations:
+            with st.expander("🔄 Alle Iterationen"):
+                for iter_data in iterations:
+                    st.markdown(f"**Iteration {iter_data['iteration']}:**")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("Claude:")
+                        st.json(iter_data['claude']['answers'])
+                    with col2:
+                        st.markdown("GPT-4:")
+                        st.json(iter_data['gpt4']['answers'])
 
-# --- Footer ---
+# Footer
 st.markdown("---")
-st.caption("Made by Fox | Double-verification system for maximum accuracy")
+st.caption("Multi-Model Consensus System | Claude 4 Opus + GPT-4 Turbo")
