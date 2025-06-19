@@ -6,16 +6,11 @@ import google.generativeai as genai
 import logging
 import hashlib
 import re
-import io
+from sentence_transformers import SentenceTransformer, util
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# --- UI-Einstellungen ---
-st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
-st.title("🦊 Koifox-Bot")
-st.markdown("*Multi-Model Consensus System mit optimierter OCR*")
 
 # --- API Key Validation ---
 def validate_keys():
@@ -25,342 +20,288 @@ def validate_keys():
         'openai_key': ('sk-', "OpenAI")
     }
     missing = []
+    invalid = []
     
     for key, (prefix, name) in required_keys.items():
         if key not in st.secrets:
             missing.append(name)
         elif not st.secrets[key].startswith(prefix):
-            missing.append(f"{name} (invalid)")
+            invalid.append(name)
     
-    if missing:
-        st.error(f"Fehlende API Keys: {', '.join(missing)}")
+    if missing or invalid:
+        st.error(f"API Key Problem: Missing {', '.join(missing)} | Invalid {', '.join(invalid)}")
         st.stop()
 
 validate_keys()
 
-# --- API Clients initialisieren ---
+# --- UI-Einstellungen ---
+st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
+st.title("🦊 Koifox-Bot")
+st.markdown("*Verbesserte OCR Version mit Chain-of-Thought und Konsistenzprüfung*")
+
+# --- Gemini Flash Konfiguration ---
 genai.configure(api_key=st.secrets["gemini_key"])
 vision_model = genai.GenerativeModel("gemini-1.5-flash")
-claude_client = Anthropic(api_key=st.secrets["claude_key"])
-openai_client = OpenAI(api_key=st.secrets["openai_key"])
 
-# --- Test welches GPT Modell verfügbar ist ---
-@st.cache_data
-def get_available_gpt_model():
-    """Testet welches GPT Modell tatsächlich funktioniert"""
-    test_models = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o"]
-    
-    for model in test_models:
-        try:
-            response = openai_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "Test"}],
-                max_tokens=10
-            )
-            logger.info(f"Model {model} ist verfügbar")
-            return model
-        except Exception as e:
-            logger.warning(f"Model {model} nicht verfügbar: {str(e)}")
-            continue
-    
-    return "gpt-3.5-turbo"
+# --- SentenceTransformer für Konsistenzprüfung ---
+@st.cache_resource
+def load_sentence_transformer():
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
-GPT_MODEL = get_available_gpt_model()
-st.sidebar.info(f"🤖 Verwende: Claude + {GPT_MODEL}")
+sentence_model = load_sentence_transformer()
 
-# --- VERBESSERTE GEMINI OCR ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def extract_text_with_gemini(_image_bytes, file_hash):
-    """Extrahiert KOMPLETTEN Text aus Bild mit Gemini"""
+# --- Verbesserte OCR ---
+@st.cache_data(ttl=3600)
+def extract_text_with_gemini_improved(_image, file_hash):
+    """Extrahiert KOMPLETTEN Text aus Bild"""
     try:
-        logger.info(f"Starting Gemini OCR for hash: {file_hash[:8]}...")
+        logger.info(f"Starting GEMINI OCR for file hash: {file_hash}")
         
-        # Image aus bytes laden
-        image = Image.open(io.BytesIO(_image_bytes))
+        # Bildskalierung beibehalten, da manuelle Vorverarbeitung erfolgt
+        max_size = 3000
+        if _image.width > max_size or _image.height > max_size:
+            _image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            st.sidebar.warning(f"Bild wurde auf {max_size}px skaliert")
         
-        # Bild nicht zu stark verkleinern für bessere OCR
-        max_size = 4096
-        if max(image.width, image.height) > max_size:
-            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        
-        # Verbesserter OCR Prompt
-        ocr_prompt = """
-        Extrahiere WIRKLICH ALLEN Text aus diesem Prüfungsbild:
-        
-        1. Beginne GANZ OBEN und lies bis GANZ UNTEN
-        2. Erfasse JEDE ZEILE Text
-        3. Inkludiere:
-           - Alle Aufgabennummern (z.B. "Aufgabe 45 (5 RP)")
-           - Komplette Aufgabentexte
-           - ALLE Formeln und mathematische Ausdrücke
-           - ALLE Antwortoptionen (A, B, C, D, E) mit vollem Text
-           - Alle Zahlen, Werte, Parameter
-        4. Behalte die exakte Formatierung bei
-        5. Überspringe NICHTS
-        6. Interpretiere oder löse NICHTS
-        
-        Gib den KOMPLETTEN Text wieder, vom ersten bis zum letzten Zeichen!
-        """
-        
-        # OCR mit höheren Limits
+        # Strukturierter OCR Prompt
         response = vision_model.generate_content(
-            [ocr_prompt, image],
+            [
+                """Extract ALL text from this exam image in a structured format.
+                IMPORTANT:
+                - Read EVERYTHING from top to bottom
+                - Structure the output as follows:
+                  - Aufgabe [Nummer]: [Fragetext]
+                    - Option A: [Text]
+                    - Option B: [Text]
+                    - ...
+                    - Formeln: [z. B. f(r₁,r₂) = (r₁^α + r₂^β)^γ]
+                - Include ALL questions, formulas, values, and answer options
+                - Include question numbers like "Aufgabe 45 (5 RP)"
+                - Include ALL multiple choice options (A, B, C, D, E) with their complete text
+                - Include mathematical symbols and formulas exactly as shown
+                - DO NOT summarize or skip any part
+                - DO NOT solve anything
+                
+                Start from the very top and continue to the very bottom of the image.""",
+                _image
+            ],
             generation_config={
                 "temperature": 0,
-                "top_p": 1,
-                "top_k": 1,
-                "max_output_tokens": 16384  # Maximale Token!
+                "max_output_tokens": 8000
             }
         )
         
-        ocr_text = response.text.strip()
-        logger.info(f"Gemini OCR completed: {len(ocr_text)} characters")
+        ocr_result = response.text.strip()
         
-        # Validierung
-        if len(ocr_text) < 500:
-            logger.warning(f"OCR möglicherweise unvollständig: nur {len(ocr_text)} Zeichen")
-            # Zweiter Versuch mit anderem Prompt
-            response2 = vision_model.generate_content(
-                ["Read and transcribe EVERY SINGLE word from this exam image. Start from the very top and continue to the very bottom. Include all text, numbers, formulas, and answer options.", image],
-                generation_config={"temperature": 0, "max_output_tokens": 16384}
-            )
-            if len(response2.text) > len(ocr_text):
-                ocr_text = response2.text.strip()
-                logger.info(f"Zweiter OCR-Versuch erfolgreicher: {len(ocr_text)} Zeichen")
+        # Prüfe ob genug Text extrahiert wurde
+        if len(ocr_result) < 500:
+            st.warning(f"⚠️ Nur {len(ocr_result)} Zeichen extrahiert - möglicherweise unvollständig!")
         
-        return ocr_text
+        logger.info(f"GEMINI OCR completed: {len(ocr_result)} characters")
+        return ocr_result
         
     except Exception as e:
         logger.error(f"Gemini OCR Error: {str(e)}")
         raise e
 
-# --- Lösungsextraktion ---
-def extract_answers(solution_text):
-    """Extrahiert strukturierte Antworten aus Lösungstext"""
-    answers = {}
-    
-    # Verschiedene Patterns probieren
-    patterns = [
-        r'Aufgabe\s*(\d+)\s*:\s*([A-E,\s]+|\d+[\d,\.]*)',
-        r'Task\s*(\d+)\s*:\s*([A-E,\s]+|\d+[\d,\.]*)',
-        r'(\d+)\.\s*([A-E,\s]+|\d+[\d,\.]*)'
-    ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, solution_text, re.IGNORECASE | re.MULTILINE)
-        for task_num, answer in matches:
-            answer = answer.strip()
-            if any(letter in answer.upper() for letter in 'ABCDE'):
-                answer = ''.join(sorted(c for c in answer.upper() if c in 'ABCDE'))
-            answers[f"Aufgabe {task_num}"] = answer
-    
-    return answers
+# --- Konsistenzprüfung zwischen LLMs ---
+def are_answers_similar(answer1, answer2):
+    """Vergleicht zwei Antworten auf semantische Ähnlichkeit"""
+    try:
+        embeddings = sentence_model.encode([answer1, answer2])
+        similarity = util.cos_sim(embeddings[0], embeddings[1]).item()
+        logger.info(f"Antwortähnlichkeit: {similarity:.2f}")
+        return similarity > 0.9
+    except Exception as e:
+        logger.error(f"Konsistenzprüfung fehlgeschlagengypten: {str(e)}")
+        return False
 
-# --- Claude Solver ---
-def solve_with_claude(ocr_text):
-    """Claude löst die Aufgabe"""
+# --- Claude Solver mit Chain-of-Thought ---
+def solve_with_claude_formatted(ocr_text):
+    """Claude löst und formatiert korrekt mit Chain-of-Thought"""
     
     prompt = f"""Du bist ein Experte für "Internes Rechnungswesen (31031)" an der Fernuni Hagen.
 
-KRITISCHE REGELN:
-- Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
-- Wenn nur α + β gegeben ist (ohne α = β), ist die Funktion NICHT homogen
-- Bei Multiple Choice: Prüfe JEDE Option einzeln
-- Beantworte ALLE Aufgaben die du im Text findest
-
-ANALYSIERE DIESEN TEXT:
+VOLLSTÄNDIGER AUFGABENTEXT:
 {ocr_text}
 
-FORMAT für JEDE gefundene Aufgabe:
-Aufgabe [Nr]: [Antwort]
-Begründung: [Kurze Erklärung auf Deutsch]
+WICHTIGE REGELN:
+1. Identifiziere ALLE Aufgaben im Text (z.B. "Aufgabe 45", "Aufgabe 46" etc.)
+2. Bei Homogenität: f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
+3. Beantworte JEDE Aufgabe die du findest
+4. Denke schrittweise:
+   - Lies die Aufgabe sorgfältig
+   - Identifiziere alle relevanten Formeln und Werte
+   - Führe die Berechnung explizit durch
+   - Überprüfe dein Ergebnis
+5. Bei Multiple-Choice-Fragen: Analysiere jede Option und begründe, warum sie richtig oder falsch ist
 
-WICHTIG: Überspringe keine Aufgabe!"""
+AUSGABEFORMAT (STRIKT EINHALTEN):
+Aufgabe [Nummer]: [Antwort]
+Begründung: [Schritt-für-Schritt-Erklärung]
+Berechnung: [Mathematische Schritte]
 
-    response = claude_client.messages.create(
+Wiederhole dies für JEDE Aufgabe im Text.
+
+Beispiel:
+Aufgabe 45: 500
+Begründung: Der Parameter a entspricht dem Achsenabschnitt bei p = 0, also a = 500.
+Berechnung: a = f(0) = 500
+
+Aufgabe 46: b
+Begründung: Um Parameter b zu bestimmen...
+Berechnung: b = (f(1) - f(0)) / x
+
+WICHTIG: Vergiss keine Aufgabe!"""
+
+    client = Anthropic(api_key=st.secrets["claude_key"])
+    response = client.messages.create(
         model="claude-4-opus-20250514",
-        max_tokens=3000,
+        max_tokens=4000,
         temperature=0.1,
+        system="Beantworte ALLE Aufgaben die im Text stehen. Überspringe keine.",
         messages=[{"role": "user", "content": prompt}]
     )
     
     return response.content[0].text
 
-# --- GPT Solver ---
+# --- GPT-4 Turbo Solver ---
 def solve_with_gpt(ocr_text):
-    """GPT löst die Aufgabe"""
+    """GPT-4 Turbo löst mit Chain-of-Thought"""
     
     prompt = f"""Du bist ein Experte für "Internes Rechnungswesen (31031)" an der Fernuni Hagen.
 
-KRITISCHE REGELN:
-- Eine Funktion f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
-- Wenn nur α + β gegeben ist (ohne α = β), ist die Funktion NICHT homogen
-- Bei Multiple Choice: Prüfe JEDE Option einzeln
-- Beantworte ALLE Aufgaben die du im Text findest
-
-ANALYSIERE:
+VOLLSTÄNDIGER AUFGABENTEXT:
 {ocr_text}
 
-FORMAT für JEDE gefundene Aufgabe:
-Aufgabe [Nr]: [Antwort]
-Begründung: [Kurze Erklärung auf Deutsch]"""
+WICHTIGE REGELN:
+1. Identifiziere ALLE Aufgaben im Text (z.B. "Aufgabe 45", "Aufgabe 46" etc.)
+2. Bei Homogenität: f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
+3. Beantworte JEDE Aufgabe die du findest
+4. Denke schrittweise:
+   - Lies die Aufgabe sorgfältig
+   - Identifiziere alle relevanten Formeln und Werte
+   - Führe die Berechnung explizit durch
+   - Überprüfe dein Ergebnis
+5. Bei Multiple-Choice-Fragen: Analysiere jede Option und begründe, warum sie richtig oder falsch ist
 
-    response = openai_client.chat.completions.create(
-        model=GPT_MODEL,
+AUSGABEFORMAT (STRIKT EINHALTEN):
+Aufgabe [Nummer]: [Antwort]
+Begründung: [Schritt-für-Schritt-Erklärung]
+Berechnung: [Mathematische Schritte]
+
+Wiederhole dies für JEDE Aufgabe im Text."""
+
+    client = OpenAI(api_key=st.secrets["openai_key"])
+    response = client.chat.completions.create(
+        model="gpt-4-turbo",
         messages=[
-            {"role": "system", "content": "Du bist ein präziser Mathematik-Experte. Beantworte ALLE Aufgaben im Text."},
+            {"role": "system", "content": "Beantworte ALLE Aufgaben die im Text stehen. Überspringe keine."},
             {"role": "user", "content": prompt}
         ],
-        max_tokens=3000,
+        max_tokens=4000,
         temperature=0.1
     )
     
     return response.choices[0].message.content
 
-# --- Consensus System ---
-def achieve_consensus_multi(ocr_text):
-    """Consensus zwischen Claude und GPT"""
+# --- Verbesserte Ausgabeformatierung ---
+def parse_and_display_solution(solution_text, model_name="Claude"):
+    """Parst und zeigt Lösung strukturiert an"""
     
-    # Lösungen generieren
-    with st.spinner("Claude löst..."):
-        claude_solution = solve_with_claude(ocr_text)
+    # Finde alle Aufgaben mit Regex
+    task_pattern = r'Aufgabe\s+(\d+)\s*:\s*([^\n]+)'
+    tasks = re.findall(task_pattern, solution_text, re.IGNORECASE)
     
-    with st.spinner(f"{GPT_MODEL} löst..."):
-        gpt_solution = solve_with_gpt(ocr_text)
+    if not tasks:
+        st.warning(f"⚠️ Keine Aufgaben im erwarteten Format gefunden ({model_name})")
+        st.markdown(solution_text)
+        return
     
-    # Antworten extrahieren
-    claude_answers = extract_answers(claude_solution)
-    gpt_answers = extract_answers(gpt_solution)
-    
-    # Debug Info
-    with st.expander("🔍 Debug: Rohe Antworten"):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("**Claude:**")
-            st.code(claude_solution)
-        with col2:
-            st.write(f"**{GPT_MODEL}:**")
-            st.code(gpt_solution)
-    
-    with st.expander("🔍 Extrahierte Antworten"):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("**Claude:**")
-            st.json(claude_answers)
-        with col2:
-            st.write(f"**{GPT_MODEL}:**")
-            st.json(gpt_answers)
-    
-    # Vergleiche
-    all_tasks = set(claude_answers.keys()) | set(gpt_answers.keys())
-    consensus = True
-    discrepancies = []
-    
-    for task in sorted(all_tasks):
-        claude_ans = claude_answers.get(task, "?")
-        gpt_ans = gpt_answers.get(task, "?")
+    # Zeige jede Aufgabe strukturiert
+    for task_num, answer in tasks:
+        st.markdown(f"### Aufgabe {task_num}: **{answer.strip()}** ({model_name})")
         
-        if claude_ans != gpt_ans:
-            consensus = False
-            discrepancies.append(f"{task}: Claude={claude_ans}, GPT={gpt_ans}")
-            st.warning(f"❌ Diskrepanz bei {task}: Claude={claude_ans}, GPT={gpt_ans}")
-        else:
-            st.success(f"✅ Einigkeit bei {task}: {claude_ans}")
-    
-    if consensus and claude_answers:
-        st.success("🎉 Modelle sind sich einig!")
-        return claude_solution
-    else:
-        st.info("🔄 Verwende Claude mit Verifikation")
-        # Selbst-Verifikation mit Diskrepanz-Info
-        verify_prompt = (
-            "Prüfe diese Lösung kritisch:\n\n"
-            f"AUFGABE:\n{ocr_text}\n\n"
-            f"LÖSUNG:\n{claude_solution}\n\n"
-            f"DISKREPANZEN MIT ANDEREM MODELL:\n" + "\n".join(discrepancies) + "\n\n"
-            "Bei Homogenität: f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β!\n\n"
-            "Gib die FINALE KORREKTE Lösung im gleichen Format."
-        )
-
-        response = claude_client.messages.create(
-            model="claude-4-opus-20250514",
-            max_tokens=3000,
-            temperature=0.2,
-            messages=[{"role": "user", "content": verify_prompt}]
-        )
+        # Finde zugehörige Begründung und Berechnung
+        begr_pattern = rf'Aufgabe\s+{task_num}\s*:.*?\n\s*Begründung:\s*([^\n]+(?:\n(?!Aufgabe)[^\n]+)*?)(?:\n\s*Berechnung:\s*([^\n]+(?:\n(?!Aufgabe)[^\n]+)*))?(?=\n\s*Aufgabe|\Z)'
+        begr_match = re.search(begr_pattern, solution_text, re.IGNORECASE | re.DOTALL)
         
-        return response.content[0].text
+        if begr_match:
+            st.markdown(f"*Begründung: {begr_match.group(1).strip()}*")
+            if begr_match.group(2):
+                st.markdown(f"*Berechnung: {begr_match.group(2).strip()}*")
+        
+        st.markdown("---")
 
-# --- MAIN UI ---
+# --- UI ---
+# Cache leeren
+if st.sidebar.button("🗑️ Clear Cache"):
+    st.cache_data.clear()
+    st.rerun()
+
+# Debug
+debug_mode = st.checkbox("🔍 Debug-Modus", value=True)
+
+# Datei-Upload
 uploaded_file = st.file_uploader(
     "**Klausuraufgabe hochladen...**",
-    type=["png", "jpg", "jpeg"],
-    help="Lade ein klares Bild der Klausuraufgabe hoch"
+    type=["png", "jpg", "jpeg"]
 )
 
 if uploaded_file is not None:
-    # Bild anzeigen
-    image = Image.open(uploaded_file)
-    st.image(image, caption=f"Hochgeladene Klausuraufgabe ({image.width}x{image.height}px)", use_container_width=True)
-    
-    # Datei-Info
-    file_bytes = uploaded_file.getvalue()
-    file_hash = hashlib.md5(file_bytes).hexdigest()
-    st.info(f"📄 Datei: {uploaded_file.name} | Größe: {len(file_bytes)/1024:.1f} KB | Hash: {file_hash[:8]}...")
-    
-    # GEMINI OCR mit Status
-    with st.spinner("📖 Lese Text mit Gemini Flash (kann 10-20 Sekunden dauern)..."):
-        try:
-            ocr_text = extract_text_with_gemini(file_bytes, file_hash)
-            
-            # OCR Erfolgsmeldung
-            char_count = len(ocr_text)
-            if char_count < 500:
-                st.warning(f"⚠️ Nur {char_count} Zeichen extrahiert - möglicherweise unvollständig!")
-            else:
-                st.success(f"✅ OCR erfolgreich: {char_count} Zeichen extrahiert")
-                
-        except Exception as e:
-            st.error(f"❌ OCR Fehler: {str(e)}")
-            st.stop()
-    
-    # OCR Text anzeigen
-    with st.expander(f"📝 OCR-Text (Gemini) - {len(ocr_text)} Zeichen"):
-        st.code(ocr_text)
-        # Aufgaben-Erkennung
-        found_tasks = re.findall(r'Aufgabe\s+(\d+)', ocr_text, re.IGNORECASE)
-        if found_tasks:
-            st.info(f"Erkannte Aufgaben: {', '.join(set(found_tasks))}")
-    
-    # Solve Button
-    if st.button("🧮 Mit Multi-Model Consensus lösen", type="primary", disabled=(len(ocr_text) < 100)):
-        st.markdown("---")
-        st.markdown("### 🤝 Consensus-Prozess:")
+    try:
+        # Bild verarbeiten
+        file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest()
+        image = Image.open(uploaded_file)
         
-        try:
-            # Consensus erreichen
-            final_solution = achieve_consensus_multi(ocr_text)
+        # Zeige Original
+        st.image(image, caption=f"Originalbild ({image.width}x{image.height}px)", use_container_width=True)
+        
+        # OCR
+        with st.spinner("📖 Lese KOMPLETTEN Text mit Gemini..."):
+            ocr_text = extract_text_with_gemini_improved(image, file_hash)
+        
+        # OCR Ergebnis
+        with st.expander(f"🔍 OCR-Ergebnis ({len(ocr_text)} Zeichen)", expanded=debug_mode):
+            st.code(ocr_text)
             
-            # Ergebnisse anzeigen
+            # Prüfe ob Aufgaben gefunden wurden
+            found_tasks = re.findall(r'Aufgabe\s+\d+', ocr_text, re.IGNORECASE)
+            if found_tasks:
+                st.success(f"✅ Gefundene Aufgaben: {', '.join(found_tasks)}")
+            else:
+                st.error("❌ Keine Aufgaben im Text gefunden!")
+        
+        # Lösen
+        if st.button("🧮 Alle Aufgaben lösen", type="primary"):
             st.markdown("---")
-            st.markdown("### 📊 Finale Lösung:")
             
-            lines = final_solution.split('\n')
-            for line in lines:
-                if line.strip():
-                    if line.startswith('Aufgabe'):
-                        parts = line.split(':', 1)
-                        if len(parts) == 2:
-                            st.markdown(f"### {parts[0]}: **{parts[1].strip()}**")
-                    elif line.startswith('Begründung:'):
-                        st.markdown(f"*{line}*")
-                    elif not line.startswith('---'):
-                        st.markdown(line)
-                        
-        except Exception as e:
-            st.error(f"Fehler beim Lösen: {str(e)}")
-            logger.error(f"Processing error: {str(e)}", exc_info=True)
+            with st.spinner("🧮 Claude und GPT-4 lösen ALLE Aufgaben..."):
+                claude_solution = solve_with_claude_formatted(ocr_text)
+                gpt_solution = solve_with_gpt(ocr_text)
+                
+                # Konsistenzprüfung
+                if are_answers_similar(claude_solution, gpt_solution):
+                    st.success("✅ Beide Modelle sind einig!")
+                    st.markdown("### 📊 Lösungen (Claude):")
+                    parse_and_display_solution(claude_solution, model_name="Claude")
+                else:
+                    st.warning("⚠️ Modelle uneinig! Zeige beide Lösungen zur Überprüfung.")
+                    st.markdown("### 📊 Lösungen (Claude):")
+                    parse_and_display_solution(claude_solution, model_name="Claude")
+                    st.markdown("### 📊 Lösungen (GPT-4 Turbo):")
+                    parse_and_display_solution(gpt_solution, model_name="GPT-4 Turbo")
+            
+            if debug_mode:
+                with st.expander("💭 Rohe Claude-Antwort"):
+                    st.code(claude_solution)
+                with st.expander("💭 Rohe GPT-4-Antwort"):
+                    st.code(gpt_solution)
+                    
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        st.error(f"❌ Fehler: {str(e)}")
 
-# Footer
+# --- Footer ---
 st.markdown("---")
-st.caption(f"Multi-Model Consensus System | Gemini 1.5 Flash OCR + Claude 4 Opus + {GPT_MODEL}")
+st.caption("Koifox-Bot | Verbesserte OCR, Chain-of-Thought & Konsistenzprüfung")
