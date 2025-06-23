@@ -137,24 +137,7 @@ FORMAT - WICHTIG:
 Aufgabe [Nr]: [NUR die finale Antwort - Zahl oder Buchstabe(n)]
 Begründung: [1 Satz auf Deutsch]
 """
-# Zusätzlich: Response-Validierung einbauen
-def validate_response(response_text):
-    """Prüft ob Antwort und Berechnung konsistent sind"""
-    import re
-    
-    lines = response_text.split('\n')
-    for i, line in enumerate(lines):
-        if line.startswith('Aufgabe') and ':' in line:
-            answer = line.split(':', 1)[1].strip()
             
-            # Suche nach Berechnung in den nächsten Zeilen
-            for j in range(i+1, min(i+5, len(lines))):
-                if 'Begründung:' in lines[j]:
-                    # Extrahiere Zahlen aus der Begründung
-                    numbers = re.findall(r'= (\d+(?:\.\d+)?)', lines[j])
-                    if numbers and answer.replace(',', '.').replace(' ', '') != numbers[-1]:
-                        st.warning(f"⚠️ Inkonsistenz entdeckt: Antwort '{answer}' stimmt nicht mit Berechnung '{numbers[-1]}' überein!")
-                        
             if debug_mode:
                 with st.expander("🔍 Claude Prompt", expanded=False):
                     st.code(prompt)
