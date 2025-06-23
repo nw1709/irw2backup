@@ -110,10 +110,6 @@ def extract_text_with_gemini_improved(_image, file_hash):
         if "Graph:" not in ocr_result and "Table:" not in ocr_result:
             st.warning("⚠️ Keine Graphen oder Tabellen im OCR-Text gefunden. Möglicherweise wurden visuelle Elemente nicht erkannt.")
         
-        # Prüfe auf erwartete Parameter
-        if "a = 450" not in ocr_result or "b = 22.5" not in ocr_result:
-            st.warning("⚠️ Erwartete Parameter (a = 450, b = 22.5) nicht im OCR-Text gefunden. Überprüfe die Graphenbeschreibung.")
-        
         logger.info(f"GEMINI OCR completed: {len(ocr_result)} characters")
         return ocr_result
         
@@ -328,7 +324,7 @@ if uploaded_file is not None:
         st.image(image, caption=f"Originalbild ({image.width}x{image.height}px)", use_container_width=True)
         
         # OCR
-        with st.spinner("📖 Lese KOMPLETTEN Text und Graphen mit Gemini..."):
+        with st.spinner("Lese Text und Graphen mit Gemini..."):
             ocr_text = extract_text_with_gemini_improved(image, file_hash)
         
         # OCR Ergebnis
@@ -350,7 +346,7 @@ if uploaded_file is not None:
         if st.button("🧮 Alle Aufgaben lösen", type="primary"):
             st.markdown("---")
             
-            with st.spinner("🧮 Claude und GPT-4 lösen ALLE Aufgaben..."):
+            with st.spinner("Claude und GPT-4 lösen Aufgabe..."):
                 claude_solution = solve_with_claude_formatted(ocr_text)
                 gpt_solution = solve_with_gpt(ocr_text)
                 
