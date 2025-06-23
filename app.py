@@ -159,12 +159,13 @@ def solve_with_claude(ocr_text):
 # --- SOLVER MIT GPT (nur als Warnflag) ---
 def solve_with_gpt(ocr_text):
     prompt = create_base_prompt(ocr_text)
+
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4-turbo",  # Feste Modellwahl für Konsistenz
+            model=GPT_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=3500,
-            temperature=0.0,
+            max_tokens=3000,
+            temperature=0.2,
             top_p=0.1,
             seed=42
         )
