@@ -146,8 +146,8 @@ def solve_with_claude(ocr_text):
     try:
         response = claude_client.messages.create(
             model="claude-4-opus-20250514",
-            max_tokens=5000,  # Erhöht für komplexe Aufgaben
-            temperature=0.0,  # Maximale Deterministik
+            max_tokens=8000,  # Erhöht für komplexe Aufgaben
+            temperature=0.1,  # Maximale Deterministik
             top_p=0.1,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -163,7 +163,7 @@ def solve_with_gpt(ocr_text):
         response = openai_client.chat.completions.create(
             model="gpt-4-turbo",  # Feste Modellwahl für Konsistenz
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=3000,
+            max_tokens=3500,
             temperature=0.0,
             top_p=0.1,
             seed=42
