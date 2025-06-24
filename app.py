@@ -50,72 +50,157 @@ def load_sentence_transformer():
 
 sentence_model = load_sentence_transformer()
 
-# --- Verbesserte OCR mit detaillierter Graphenbeschreibung ---
-@st.cache_data(ttl=3600)
-def extract_text_with_gemini_improved(_image, file_hash):
-    """Extrahiert KOMPLETTEN Text und beschreibt Graphen detailliert"""
+# --- NEUE LOOP-DETECTION FUNKTION ---
+def detect_and_prevent_loops(text, max_repetitions=3):
+    """Erkennt Textwiederholungen und stoppt Loops"""
     try:
-        logger.info(f"Starting GEMINI OCR for file hash: {file_hash}")
+        # Teile Text in Sätze
+        sentences = re.split(r'[.!?]+', text)
         
-        # Bildskalierung beibehalten
-        max_size = 3000
-        if _image.width > max_size or _image.height > max_size:
-            _image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-            st.sidebar.warning(f"Bild wurde auf {max_size}px skaliert")
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) > 20:  # Nur längere Sätze prüfen
+                count = sum(1 for s in sentences if s.strip() == sentence)
+                if count > max_repetitions:
+                    logger.warning(f"Loop detected in GPT response: '{sentence[:50]}...' repeated {count} times")
+                    # Schneide ab beim ersten Auftreten der Wiederholung
+                    loop_start = text.find(sentence)
+                    # Finde das zweite Auftreten
+                    second_occurrence = text.find(sentence, loop_start + len(sentence))
+                    if second_occurrence != -1:
+                        clean_text = text[:second_occurrence] + "\n\n[LOOP DETECTED - STOPPING REPETITION]"
+                        logger.info(f"Cleaned text from {len(text)} to {len(clean_text)} characters")
+                        return clean_text
         
-        # Strukturierter OCR Prompt
+        return text
+    except Exception as e:
+        logger.error(f"Loop detection failed: {str(e)}")
+        return text
+
+# --- Verbessertes OCR mit Caching ---
+@st.cache_data(ttl=3600)
+def extract_text_with_gemini(_image, file_hash):
+    try:
+        logger.info(f"Starting OCR for file hash: {file_hash}")
         response = vision_model.generate_content(
             [
-                """Extract ALL content from this exam image in a structured format, including text, formulas, and visual elements like graphs, diagrams, or tables.
-
-                IMPORTANT:
-                - Read ALL text from top to bottom, including:
-                  - Question numbers (e.g., "Aufgabe 45 (5 RP)")
-                  - All questions, formulas, values, and answer options (A, B, C, D, E) with their complete text
-                  - Mathematical symbols and formulas exactly as shown (e.g., f(r₁,r₂) = (r₁^α + r₂^β)^γ)
-                - For graphs, diagrams, or tables:
-                  - Describe ALL visual elements in detail, including:
-                    - Axes labels (e.g., x-axis: "Quantity", y-axis: "Cost")
-                    - ALL data points or values shown (e.g., "Point at (10, 500)")
-                    - Curve shapes or trends (e.g., "Linear increasing curve")
-                    - ALL annotations or labels in the graph
-                    - If a table is present, extract it as a structured table (e.g., rows and columns)
-                - Structure the output as follows:
-                  - Aufgabe [Nummer]: [Fragetext]
-                    - Option A: [Text]
-                    - Option B: [Text]
-                    - ...
-                    - Formeln: [z. B. f(r₁,r₂) = (r₁^α + r₂^β)^γ]
-                    - Graph/Table: [Detailed description, including ALL data points]
-                - DO NOT summarize or skip any part
-                - DO NOT solve anything
-                - Ensure numerical parameters (e.g., a = 450, b = 22.5) are explicitly listed if present
-                
-                Start from the very top and continue to the very bottom of the image.""",
+                "Extract ALL text from this exam image EXACTLY as written, including EVERY detail from graphs, charts, or sketches. For graphs: Explicitly list ALL axis labels, ALL scales, ALL intersection points with axes (e.g., 'x-axis at 450', 'y-axis at 20'), and EVERY numerical value or annotation. Do NOT interpret, solve, or infer beyond the visible text and numbers. Output a COMPLETE verbatim transcription with NO omissions.",
                 _image
             ],
             generation_config={
-                "temperature": 0,
-                "max_output_tokens": 10000
+                "temperature": 0.0,
+                "max_output_tokens": 12000
             }
         )
+        ocr_text = response.text.strip()
         
-        ocr_result = response.text.strip()
-        
-        # Prüfe ob genug Text extrahiert wurde
-        if len(ocr_result) < 500:
-            st.warning(f"⚠️ Nur {len(ocr_result)} Zeichen extrahiert - möglicherweise unvollständig! Überprüfe, ob Graphen/Diagramme erkannt wurden.")
-        
-        # Prüfe auf Graphenbeschreibungen
-        if "Graph:" not in ocr_result and "Table:" not in ocr_result:
-            st.warning("⚠️ Keine Graphen oder Tabellen im OCR-Text gefunden. Möglicherweise wurden visuelle Elemente nicht erkannt.")
-        
-        logger.info(f"GEMINI OCR completed: {len(ocr_result)} characters")
-        return ocr_result
+        logger.info(f"OCR result length: {len(ocr_text)} characters, content: {ocr_text[:200]}...")
+        return ocr_text
         
     except Exception as e:
         logger.error(f"Gemini OCR Error: {str(e)}")
         raise e
+
+# --- ROBUSTE ANTWORTEXTRAKTION ---
+def extract_structured_answers(solution_text):
+    result = {}
+    lines = solution_text.split('\n')
+    current_task = None
+    current_answer = None
+    current_reasoning = []
+    
+    # Verbesserte Regex-Patterns für verschiedene Formate
+    task_patterns = [
+        r'Aufgabe\s*(\d+)\s*:\s*(.+)',  # Standard Format
+        r'Task\s*(\d+)\s*:\s*(.+)',     # Englisch
+        r'(\d+)[\.\)]\s*(.+)',          # Nummeriert mit Punkt/Klammer
+        r'Lösung\s*(\d+)\s*:\s*(.+)'    # Alternative
+    ]
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        task_found = False
+        for pattern in task_patterns:
+            task_match = re.match(pattern, line, re.IGNORECASE)
+            if task_match:
+                # Speichere vorherige Aufgabe
+                if current_task and current_answer:
+                    result[f"Aufgabe {current_task}"] = {
+                        'answer': current_answer,
+                        'reasoning': ' '.join(current_reasoning).strip()
+                    }
+                    logger.info(f"Stored task: Aufgabe {current_task}, answer: {current_answer}")
+                
+                current_task = task_match.group(1)
+                raw_answer = task_match.group(2).strip()
+                
+                # Verbesserte Antwort-Normalisierung
+                if re.match(r'^[A-E,\s]+$', raw_answer):
+                    current_answer = ''.join(sorted(c for c in raw_answer.upper() if c in 'ABCDE'))
+                else:
+                    # Extrahiere nur Buchstaben/Zahlen als Antwort
+                    clean_answer = re.sub(r'[^\w]', '', raw_answer)
+                    current_answer = clean_answer if clean_answer else raw_answer
+                
+                current_reasoning = []
+                task_found = True
+                logger.info(f"Detected task: Aufgabe {current_task}, answer: {current_answer}")
+                break
+        
+        if not task_found:
+            if line.startswith('Begründung:'):
+                reasoning_text = line.replace('Begründung:', '').strip()
+                if reasoning_text:
+                    current_reasoning = [reasoning_text]
+            elif current_task and line and not any(re.match(p, line, re.IGNORECASE) for p in task_patterns):
+                current_reasoning.append(line)
+    
+    # Letzte Aufgabe speichern
+    if current_task and current_answer:
+        result[f"Aufgabe {current_task}"] = {
+            'answer': current_answer,
+            'reasoning': ' '.join(current_reasoning).strip()
+        }
+        logger.info(f"Final task stored: Aufgabe {current_task}, answer: {current_answer}")
+    
+    if not result:
+        logger.warning("No tasks detected in solution. Full text: %s", solution_text)
+    
+    return result
+
+# --- OCR-Text-Überprüfung ---
+def validate_ocr_with_llm(ocr_text, model_type):
+    prompt = f"""You are an expert in text validation. The following text is OCR data extracted from an exam image. Your task is to reflect this text EXACTLY as provided, without interpretation or changes, and confirm its completeness. Output the text verbatim and add a note: 'Text reflected accurately' if it matches the input, or 'Text may be incomplete' if anything seems missing.
+
+OCR Text:
+{ocr_text}
+"""
+    try:
+        if model_type == "claude":
+            response = claude_client.messages.create(
+                model="claude-4-opus-20250514",
+                max_tokens=8000,
+                temperature=0.1,
+                top_p=0.1,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            logger.info(f"Claude OCR validation received, length: {len(response.content[0].text)} characters")
+            return response.content[0].text
+        elif model_type == "gpt":
+            response = openai_client.chat.completions.create(
+                model="gpt-4-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=4000,
+                temperature=0.1
+            )
+            logger.info(f"GPT OCR validation received, length: {len(response.choices[0].message.content)} characters")
+            return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Validation Error ({model_type}): {str(e)}")
+        return None
 
 # --- Numerischer Vergleich der Endantworten ---
 def compare_numerical_answers(answers1, answers2):
@@ -259,6 +344,19 @@ WICHTIG: Vergiss keine Aufgabe!"""
         max_tokens=4000,
         temperature=0.1
     )
+
+    # LOOP-DETECTION ANWENDEN
+    raw_response = response.choices[0].message.content
+    cleaned_response = detect_and_prevent_loops(raw_response)
+    
+    if len(cleaned_response) != len(raw_response):
+        logger.info(f"GPT loop detected and cleaned: {len(raw_response)} -> {len(cleaned_response)} chars")
+    
+    return cleaned_response
+
+# --- Verbesserte Ausgabeformatierung mit Konsistenzprüfung ---
+def parse_and_display_solution(solution_text, model_name="Claude"):
+    """Parst und zeigt Lösung strukturiert an, prüft Konsistenz mit Berechnung"""
     
     return response.choices[0].message.content
 
@@ -325,7 +423,7 @@ if uploaded_file is not None:
         
         # OCR
         with st.spinner("Lese Text und Graphen mit Gemini..."):
-            ocr_text = extract_text_with_gemini_improved(image, file_hash)
+            ocr_text = extract_text_with_gemini(image, file_hash)
         
         # OCR Ergebnis
         with st.expander(f"🔍 OCR-Ergebnis ({len(ocr_text)} Zeichen)", expanded=debug_mode):
