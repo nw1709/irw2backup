@@ -219,26 +219,52 @@ def compare_numerical_answers(answers1, answers2):
 
 # --- Konsistenzprüfung zwischen LLMs ---
 def are_answers_similar(answer1, answer2):
-    """Vergleicht die Endantworten auf semantische Ähnlichkeit und numerisch"""
     try:
-        # Extrahiere Endantworten
+        # Extrahiere nur die numerischen Antworten
         task_pattern = r'Aufgabe\s+\d+\s*:\s*([^\n]+)'
-        answers1 = re.findall(task_pattern, answer1, re.IGNORECASE)
-        answers2 = re.findall(task_pattern, answer2, re.IGNORECASE)
+        answers1_raw = re.findall(task_pattern, answer1, re.IGNORECASE)
+        answers2_raw = re.findall(task_pattern, answer2, re.IGNORECASE)
         
-        if not answers1 or not answers2:
+        if not answers1_raw or not answers2_raw:
             logger.warning("Keine Endantworten für Konsistenzprüfung gefunden")
-            return False, [], []
+            return False, [], [], []
         
-        # Semantische Ähnlichkeit
-        embeddings = sentence_model.encode([' '.join(answers1), ' '.join(answers2)])
-        similarity = util.cos_sim(embeddings[0], embeddings[1]).item()
-        logger.info(f"Antwortähnlichkeit (Endantworten): {similarity:.2f}")
+        # Normalisiere Antworten: Extrahiere nur Zahlen oder Multiple-Choice-Optionen
+        def normalize_answer(raw_answer):
+            # Entferne alles außer Zahlen, Kommas, Punkten und Buchstaben A-E
+            clean = re.sub(r'[^0-9.,ABCDE]', '', raw_answer).strip()
+            # Konvertiere zu Float, wenn möglich, sonst als String behalten
+            try:
+                return str(float(clean.replace(',', '.')))
+            except ValueError:
+                return clean.upper()
+        
+        answers1 = [normalize_answer(a) for a in answers1_raw]
+        answers2 = [normalize_answer(a) for a in answers2_raw]
+        
+        # Prüfe Begründungen (optional, nur wenn vorhanden)
+        reasoning1 = re.findall(r'Begründung:\s*(.+?)(?=\nAufgabe|\Z)', answer1, re.DOTALL)
+        reasoning2 = re.findall(r'Begründung:\s*(.+?)(?=\nAufgabe|\Z)', answer2, re.DOTALL)
+        
+        # Semantische Ähnlichkeit der Antworten
+        embeddings_answers = sentence_model.encode([' '.join(answers1), ' '.join(answers2)])
+        similarity_answers = util.cos_sim(embeddings_answers[0], embeddings_answers[1]).item()
+        logger.info(f"Antwortähnlichkeit: {similarity_answers:.2f}")
+        
+        # Begründungsähnlichkeit (nur wenn Begründungen vorhanden)
+        similarity_reasoning = 1.0  # Standardwert, falls keine Begründung
+        if reasoning1 and reasoning2:
+            embeddings_reasoning = sentence_model.encode([' '.join(reasoning1), ' '.join(reasoning2)])
+            similarity_reasoning = util.cos_sim(embeddings_reasoning[0], embeddings_reasoning[1]).item()
+            logger.info(f"Begründungsähnlichkeit: {similarity_reasoning:.2f}")
         
         # Numerischer Vergleich
         numerical_differences = compare_numerical_answers(answers1, answers2)
         
-        return similarity > 0.8 and not numerical_differences, answers1, answers2, numerical_differences
+        # Konsistenzkriterium: Antwortähnlichkeit und keine numerischen Unterschiede
+        # Begründungsähnlichkeit ist nur ein Hinweis, kein Ausschlusskriterium
+        is_similar = (similarity_answers > 0.7 and not numerical_differences)
+        return is_similar, answers1, answers2, numerical_differences
     except Exception as e:
         logger.error(f"Konsistenzprüfung fehlgeschlagen: {str(e)}")
         return False, [], [], []
