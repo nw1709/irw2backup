@@ -1,11 +1,13 @@
 import streamlit as st
-from anthropic import Anthropic
-from openai import OpenAI
+from anthropic import Anthropic, AnthropicError
+from openai import OpenAI, OpenAIError
 from PIL import Image
 import google.generativeai as genai
 import logging
 import hashlib
 import re
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -36,7 +38,15 @@ validate_keys()
 # --- UI-Einstellungen ---
 st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
 st.title("🦊 Koifox-Bot")
-st.markdown("*Optimierte Fusion für maximale Präzision*")
+st.markdown("*Made with coffee, deep minimal and tiny gummy bears*")
+
+# --- Cache Management ---
+col1, col2 = st.columns([3, 1])
+with col2:
+    if st.button("🗑️ Cache leeren", type="secondary", help="Löscht gespeicherte OCR-Ergebnisse"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
 
 # --- API Clients ---
 genai.configure(api_key=st.secrets["gemini_key"])
@@ -44,7 +54,7 @@ vision_model = genai.GenerativeModel("gemini-1.5-flash")
 claude_client = Anthropic(api_key=st.secrets["claude_key"])
 openai_client = OpenAI(api_key=st.secrets["openai_key"])
 
-# --- OCR mit Caching (unverändert von beiden) ---
+# --- Verbessertes OCR mit Caching ---
 @st.cache_data(ttl=3600)
 def extract_text_with_gemini(_image, file_hash):
     try:
@@ -56,32 +66,31 @@ def extract_text_with_gemini(_image, file_hash):
             ],
             generation_config={
                 "temperature": 0.0,
-                "max_output_tokens": 12000
+                "max_output_tokens": 8000
             }
         )
         ocr_text = response.text.strip()
-        logger.info(f"OCR result length: {len(ocr_text)} characters")
+        logger.info(f"OCR result length: {len(ocr_text)} characters, content: {ocr_text[:200]}...")
         return ocr_text
     except Exception as e:
         logger.error(f"Gemini OCR Error: {str(e)}")
         raise e
 
-# --- VERBESSERTE ANTWORTEXTRAKTION mit Multiple-Choice-Handling ---
+# --- ROBUSTE ANTWORTEXTRAKTION ---
 def extract_structured_answers(solution_text):
-    """Extrahiert Antworten mit verbesserter Multiple-Choice-Erkennung"""
     result = {}
     lines = solution_text.split('\n')
-    
-    # Patterns für Aufgabenerkennung
-    task_patterns = [
-        r'Aufgabe\s*(\d+)\s*:\s*(.+)',
-        r'Task\s*(\d+)\s*:\s*(.+)',
-        r'(\d+)[\.\)]\s*(.+)'
-    ]
-    
     current_task = None
     current_answer = None
     current_reasoning = []
+    
+    # Verbesserte Regex-Patterns für verschiedene Formate
+    task_patterns = [
+        r'Aufgabe\s*(\d+)\s*:\s*(.+)',  # Standard Format
+        r'Task\s*(\d+)\s*:\s*(.+)',     # Englisch
+        r'(\d+)[\.\)]\s*(.+)',          # Nummeriert mit Punkt/Klammer
+        r'Lösung\s*(\d+)\s*:\s*(.+)'    # Alternative
+    ]
     
     for line in lines:
         line = line.strip()
@@ -98,20 +107,30 @@ def extract_structured_answers(solution_text):
                         'answer': current_answer,
                         'reasoning': ' '.join(current_reasoning).strip()
                     }
+                    logger.info(f"Stored task: Aufgabe {current_task}, answer: {current_answer}")
                 
                 current_task = task_match.group(1)
                 raw_answer = task_match.group(2).strip()
                 
-                # Intelligente Antwort-Normalisierung
-                current_answer = normalize_answer(raw_answer)
+                # Verbesserte Antwort-Normalisierung
+                if re.match(r'^[A-E,\s]+$', raw_answer):
+                    current_answer = ''.join(sorted(c for c in raw_answer.upper() if c in 'ABCDE'))
+                else:
+                    # Extrahiere nur Buchstaben/Zahlen als Antwort
+                    clean_answer = re.sub(r'[^\w]', '', raw_answer)
+                    current_answer = clean_answer if clean_answer else raw_answer
+                
                 current_reasoning = []
                 task_found = True
+                logger.info(f"Detected task: Aufgabe {current_task}, answer: {current_answer}")
                 break
         
-        if not task_found and current_task:
+        if not task_found:
             if line.startswith('Begründung:'):
-                current_reasoning.append(line.replace('Begründung:', '').strip())
-            elif not any(re.match(p, line, re.IGNORECASE) for p in task_patterns):
+                reasoning_text = line.replace('Begründung:', '').strip()
+                if reasoning_text:
+                    current_reasoning = [reasoning_text]
+            elif current_task and line and not any(re.match(p, line, re.IGNORECASE) for p in task_patterns):
                 current_reasoning.append(line)
     
     # Letzte Aufgabe speichern
@@ -120,280 +139,247 @@ def extract_structured_answers(solution_text):
             'answer': current_answer,
             'reasoning': ' '.join(current_reasoning).strip()
         }
+        logger.info(f"Final task stored: Aufgabe {current_task}, answer: {current_answer}")
+    
+    if not result:
+        logger.warning("No tasks detected in solution. Full text: %s", solution_text)
     
     return result
 
-def normalize_answer(raw_answer):
-    """Normalisiert Antworten für konsistenten Vergleich"""
-    # Entferne führende/trailing whitespace
-    answer = raw_answer.strip()
-    
-    # Fall 1: Multiple-Choice mit Buchstaben
-    if re.match(r'^[A-E](\s*[,;]\s*[A-E])*$', answer, re.IGNORECASE):
-        # Extrahiere und sortiere Buchstaben
-        letters = re.findall(r'[A-E]', answer.upper())
-        return ''.join(sorted(set(letters)))
-    
-    # Fall 2: Numerische Antwort
-    # Erhalte Kommas für die Anzeige, aber normalisiere intern
-    numeric_match = re.search(r'[\d,.\-]+', answer)
-    if numeric_match:
-        return numeric_match.group(0)
-    
-    # Fall 3: Text-Antwort
-    return answer
+# --- OCR-Text-Überprüfung ---
+def validate_ocr_with_llm(ocr_text, model_type):
+    prompt = f"""You are an expert in text validation. The following text is OCR data extracted from an exam image. Your task is to reflect this text EXACTLY as provided, without interpretation or changes, and confirm its completeness. Output the text verbatim and add a note: 'Text reflected accurately' if it matches the input, or 'Text may be incomplete' if anything seems missing.
 
-# --- INTELLIGENTER ANTWORTVERGLEICH ---
-def answers_are_equivalent(answer1, answer2):
-    """Prüft ob zwei Antworten äquivalent sind"""
-    # Direkte Übereinstimmung
-    if answer1 == answer2:
-        return True
-    
-    # Multiple-Choice Vergleich
-    if re.match(r'^[A-E]+$', answer1) and re.match(r'^[A-E]+$', answer2):
-        return set(answer1) == set(answer2)
-    
-    # Numerischer Vergleich mit Toleranz
+OCR Text:
+{ocr_text}
+"""
     try:
-        num1 = float(answer1.replace(',', '.'))
-        num2 = float(answer2.replace(',', '.'))
-        
-        # Relative Toleranz für "ca." Angaben
-        relative_tolerance = 0.02  # 2%
-        absolute_tolerance = 0.01
-        
-        return abs(num1 - num2) <= max(absolute_tolerance, relative_tolerance * max(abs(num1), abs(num2)))
-    except:
-        pass
-    
-    # Text-basierter Vergleich (case-insensitive)
-    return answer1.lower() == answer2.lower()
+        if model_type == "claude":
+            response = claude_client.messages.create(
+                model="claude-4-opus-20250514",
+                max_tokens=8000,
+                temperature=0.1,
+                top_p=0.1,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            logger.info(f"Claude OCR validation received, length: {len(response.content[0].text)} characters")
+            return response.content[0].text
+        elif model_type == "gpt":
+            response = openai_client.chat.completions.create(
+                model="gpt-4-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=8000,
+                temperature=0.1
+            )
+            logger.info(f"GPT OCR validation received, length: {len(response.choices[0].message.content)} characters")
+            return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Validation Error ({model_type}): {str(e)}")
+        return None
 
-# --- OPTIMIERTER PROMPT (Fusion der besten Elemente) ---
-def create_optimized_prompt(ocr_text):
-    return f"""Du bist ein Experte für "Internes Rechnungswesen (31031)" an der Fernuni Hagen.
+# --- OPTIMIERTER PROMPT MIT STRIKTER FORMAT-VORGABE ---
+def create_base_prompt(ocr_text):
+    return f"""You are a PhD-level expert in 'Internes Rechnungswesen (31031)' at Fernuniversität Hagen. Solve exam questions with 100% accuracy, strictly adhering to the decision-oriented German managerial-accounting framework as taught in Fernuni Hagen lectures and past exam solutions. The following text is the OCR data extracted from an exam image - use it EXCLUSIVELY to solve the questions:
 
-VOLLSTÄNDIGER AUFGABENTEXT:
 {ocr_text}
 
-WICHTIGE REGELN:
-1. Identifiziere ALLE Aufgaben im Text (z.B. "Aufgabe 45", "Aufgabe 46" etc.)
-2. Bei Homogenität: f(r₁,r₂) = (r₁^α + r₂^β)^γ ist NUR homogen wenn α = β
-3. Beantworte JEDE Aufgabe die du findest
-4. Denke schrittweise (Chain-of-Thought):
-   - Lies die Aufgabe sorgfältig
-   - Identifiziere relevante Daten und Formeln
-   - Führe die Berechnung explizit durch
-   - Überprüfe dein Ergebnis
-5. Bei Multiple-Choice: Gib NUR den/die Buchstaben an (z.B. "B" oder "A,C")
-6. Bei numerischen Antworten: Gib die Zahl mit Komma an (z.B. "22,5")
-7. Nutze ausschließlich die im OCR-Text gegebenen Daten
+INSTRUCTIONS:
+1. Read the task EXTREMELY carefully
+2. For graphs or charts: Use only the explicitly provided axis labels, scales, and intersection points to perform calculations (e.g., 'x-axis at 450')
+3. Analyze the problem step-by-step as per Fernuni methodology
+4. For multiple choice: Evaluate each option individually based solely on the given data
+5. Perform a self-check: Re-evaluate your answer to ensure it aligns with Fernuni standards and the exact OCR input
 
-AUSGABEFORMAT (EXAKT EINHALTEN):
-Aufgabe [Nr]: [Antwort]
-Begründung: [Kurze Erklärung auf Deutsch]
+CRITICAL: You MUST provide answers in this EXACT format for EVERY task found:
 
-Beispiele:
-Aufgabe 45: B
-Begründung: Die Funktion ist homogen vom Grad 1, da α = β = 0.5
+Aufgabe [Nr]: [Final answer]
+Begründung: [1 brief but consise sentence in German]
 
-Aufgabe 48: 11,50
-Begründung: Gewinnmaximum bei Ableitung = 0"""
+NO OTHER FORMAT IS ACCEPTABLE. If you cannot determine a task number, use the closest identifiable number.
+"""
 
-# --- CLAUDE SOLVER mit verbesserter Selbstkorrektur ---
+# --- SOLVER MIT CLAUDE OPUS 4 MIT VERBESSERTER SELBSTKORREKTUR ---
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type(AnthropicError))
 def solve_with_claude(ocr_text):
-    prompt = create_optimized_prompt(ocr_text)
-    
+    prompt = create_base_prompt(ocr_text)
     try:
+        logger.info("Sending request to Claude...")
         response = claude_client.messages.create(
+            model="claude-4-opus-20250514",
+            max_tokens=8000,
+            temperature=0.1,
+            top_p=0.1,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        logger.info(f"Claude response received, length: {len(response.content[0].text)} characters")
+        
+        # Prüfe ob bereits im richtigen Format
+        initial_extraction = extract_structured_answers(response.content[0].text)
+        if initial_extraction:
+            logger.info("Claude provided correctly formatted answer on first try")
+            return response.content[0].text
+        
+        # Selbstkorrektur mit STRIKTER Format-Anweisung
+        self_check_prompt = f"""The following solution needs to be reformatted. Extract EVERY task from the OCR data and provide answers in this EXACT format:
+
+Aufgabe [Nr]: [Final answer]
+Begründung: [1 sentence in German]
+
+Original solution:
+{response.content[0].text}
+
+REFORMAT NOW - USE THE EXACT FORMAT ABOVE FOR EVERY TASK:"""
+        
+        self_check_response = claude_client.messages.create(
             model="claude-4-opus-20250514",
             max_tokens=4000,
             temperature=0.1,
-            system="Löse ALLE Aufgaben präzise nach Fernuni-Standards. Format: 'Aufgabe X: [Antwort]'",
-            messages=[{"role": "user", "content": prompt}]
+            top_p=0.1,
+            messages=[{"role": "user", "content": self_check_prompt}]
         )
-        
-        solution = response.content[0].text
-        
-        # Prüfe Format und korrigiere bei Bedarf
-        if not re.search(r'Aufgabe\s+\d+\s*:', solution):
-            # Selbstkorrektur
-            correction_prompt = f"""Formatiere diese Lösung korrekt:
-
-{solution}
-
-FORMAT:
-Aufgabe [Nr]: [Antwort]
-Begründung: [Text]"""
-            
-            correction = claude_client.messages.create(
-                model="claude-4-opus-20250514",
-                max_tokens=2000,
-                temperature=0.1,
-                messages=[{"role": "user", "content": correction_prompt}]
-            )
-            solution = correction.content[0].text
-        
-        return solution
+        logger.info(f"Self-check response received, length: {len(self_check_response.content[0].text)} characters")
+        time.sleep(2)  # Verzögerung zwischen Aufrufen
+        return self_check_response.content[0].text
         
     except Exception as e:
-        logger.error(f"Claude Error: {str(e)}")
+        logger.error(f"Claude API Error: {str(e)}")
         raise e
 
-# --- GPT SOLVER ---
+# --- SOLVER MIT GPT (Backup und Validierung) ---
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type(OpenAIError))
 def solve_with_gpt(ocr_text):
-    prompt = create_optimized_prompt(ocr_text)
-    
+    prompt = create_base_prompt(ocr_text)
     try:
+        logger.info("Sending request to GPT...")
         response = openai_client.chat.completions.create(
             model="gpt-4-turbo",
-            messages=[
-                {"role": "system", "content": "Löse ALLE Aufgaben präzise nach Fernuni-Standards. Format: 'Aufgabe X: [Antwort]'"},
-                {"role": "user", "content": prompt}
-            ],
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=4000,
             temperature=0.1
         )
-        
+        logger.info(f"GPT response received, length: {len(response.choices[0].message.content)} characters")
+        time.sleep(2)  # Verzögerung
         return response.choices[0].message.content
-        
     except Exception as e:
-        logger.error(f"GPT Error: {str(e)}")
+        logger.error(f"GPT API Error: {str(e)}")
         return None
 
-# --- ERWEITERTE KREUZVALIDIERUNG ---
-def enhanced_cross_validation(ocr_text):
-    """Verbesserte Kreuzvalidierung mit intelligentem Vergleich"""
-    st.markdown("### 🔄 Erweiterte Kreuzvalidierung")
+# --- INTELLIGENTE KREUZVALIDIERUNG ---
+def cross_validation_consensus(ocr_text):
+    st.markdown("### 🔄 Kreuzvalidierung")
     
-    # Claude löst
-    with st.spinner("Claude Opus 4 analysiert..."):
+    with st.spinner("Analyse mit Claude Opus 4..."):
         claude_solution = solve_with_claude(ocr_text)
     claude_data = extract_structured_answers(claude_solution)
+    logger.info(f"Claude data extracted: {claude_data}")
     
-    # GPT als Backup/Validierung
-    with st.spinner("GPT-4 Turbo validiert..."):
+    with st.spinner("Überprüfung mit GPT-4-turbo..."):
         gpt_solution = solve_with_gpt(ocr_text)
         gpt_data = extract_structured_answers(gpt_solution) if gpt_solution else {}
+        logger.info(f"GPT data extracted: {gpt_data}")
     
-    # Intelligente Konsensbildung
-    final_answers = {}
-    all_tasks = sorted(set(claude_data.keys()) | set(gpt_data.keys()))
+    # Fallback: Wenn Claude versagt, nutze GPT
+    if not claude_data and gpt_data:
+        st.warning("⚠️ Claude konnte keine Aufgaben extrahieren - nutze GPT als Fallback")
+        claude_data = gpt_data
+        claude_solution = gpt_solution
     
-    for task in all_tasks:
-        claude_ans = claude_data.get(task, {}).get('answer', '')
-        gpt_ans = gpt_data.get(task, {}).get('answer', '')
+    all_tasks = set(claude_data.keys()) | set(gpt_data.keys())
+    differences = []
+    
+    if not claude_data:
+        st.error("❌ Beide Modelle konnten keine gültige Lösung liefern. Überprüfe den OCR-Text.")
+        return None, None
+    
+    for task in sorted(all_tasks):
+        claude_ans = claude_data.get(task, {}).get('answer', 'Keine Antwort')
+        gpt_ans = gpt_data.get(task, {}).get('answer', 'Keine Antwort') if gpt_data else 'Keine Antwort'
         
-        col1, col2, col3, col4 = st.columns([2, 3, 3, 1])
+        col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
         with col1:
             st.write(f"**{task}:**")
         with col2:
             st.write(f"Claude: `{claude_ans}`")
         with col3:
             st.write(f"GPT: `{gpt_ans}`")
-        
-        # Intelligenter Vergleich
-        if claude_ans and gpt_ans and answers_are_equivalent(claude_ans, gpt_ans):
-            final_answers[task] = claude_data[task]
-            with col4:
-                st.write("✅")
-        elif claude_ans and not gpt_ans:
-            final_answers[task] = claude_data[task]
-            with col4:
+        with col4:
+            if gpt_ans != 'Keine Antwort' and claude_ans != gpt_ans:
                 st.write("⚠️")
-        else:
-            # Bei Diskrepanz: Claude hat Priorität (da bessere Performance)
-            final_answers[task] = claude_data.get(task, gpt_data.get(task, {}))
-            with col4:
-                st.write("🔍")
+                differences.append(task)
+            else:
+                st.write("✅")
     
-    # Gesamtbewertung
-    agreement_rate = sum(1 for task in all_tasks 
-                        if task in claude_data and task in gpt_data 
-                        and answers_are_equivalent(
-                            claude_data[task]['answer'], 
-                            gpt_data[task]['answer']
-                        )) / max(len(all_tasks), 1)
-    
-    if agreement_rate > 0.8:
-        st.success(f"✅ Hohe Übereinstimmung: {agreement_rate:.0%}")
+    if not differences or not gpt_data:
+        st.success("✅ Konsens: Claude-Lösung bestätigt!")
+        return True, claude_data
     else:
-        st.warning(f"⚠️ Mittlere Übereinstimmung: {agreement_rate:.0%}")
-    
-    return final_answers, claude_solution, gpt_solution
+        st.warning(f"⚠️ Diskrepanzen bei: {', '.join(differences)}. Claude bleibt primär.")
+        return False, claude_data
 
-# --- HAUPTINTERFACE ---
-# Debug Mode
-debug_mode = st.checkbox("🔍 Debug-Modus", value=False)
+# --- UI ---
+debug_mode = st.checkbox("🔍 Debug-Modus", value=True)
 
-# Cache Management
-col1, col2 = st.columns([3, 1])
-with col2:
-    if st.button("🗑️ Cache leeren"):
-        st.cache_data.clear()
-        st.rerun()
-
-# File Upload
 uploaded_file = st.file_uploader(
     "**Klausuraufgabe hochladen...**",
-    type=["png", "jpg", "jpeg"]
+    type=["png", "jpg", "jpeg"],
+    key="file_uploader"
 )
 
 if uploaded_file is not None:
     try:
-        file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest()
-        image = Image.open(uploaded_file)
+        file_bytes = uploaded_file.getvalue()
+        file_hash = hashlib.md5(file_bytes).hexdigest()
         
+        image = Image.open(uploaded_file)
         st.image(image, caption="Hochgeladene Klausuraufgabe", use_container_width=True)
         
-        # OCR
-        with st.spinner("📖 Lese Text mit Gemini Flash 1.5..."):
+        with st.spinner("Lese Text mit Gemini Flash..."):
             ocr_text = extract_text_with_gemini(image, file_hash)
-        
-        # Debug OCR
+            
         if debug_mode:
             with st.expander("🔍 OCR-Ergebnis"):
                 st.code(ocr_text)
-                found_tasks = re.findall(r'Aufgabe\s+\d+', ocr_text, re.IGNORECASE)
-                if found_tasks:
-                    st.success(f"Gefundene Aufgaben: {', '.join(found_tasks)}")
+                st.info(f"File Hash: {file_hash[:8]}...")
+            
+            with st.expander("🔍 Claude OCR-Validierung"):
+                claude_validation = validate_ocr_with_llm(ocr_text, "claude")
+                st.code(claude_validation if claude_validation else "Fehler bei Validierung")
+            
+            with st.expander("🔍 GPT OCR-Validierung"):
+                gpt_validation = validate_ocr_with_llm(ocr_text, "gpt")
+                st.code(gpt_validation if gpt_validation else "Fehler bei Validierung")
         
-        # Lösen
-        if st.button("🧮 Aufgaben lösen", type="primary"):
-            st.markdown("---")
-            
-            # Erweiterte Kreuzvalidierung
-            final_answers, claude_full, gpt_full = enhanced_cross_validation(ocr_text)
-            
-            # Finale Ausgabe
-            st.markdown("---")
-            st.markdown("### 🎯 FINALE LÖSUNG")
-            
-            if final_answers:
-                for task, data in final_answers.items():
-                    st.markdown(f"### {task}: **{data['answer']}**")
-                    if data.get('reasoning'):
-                        st.markdown(f"*{data['reasoning']}*")
-                
-                st.success(f"✅ {len(final_answers)} Aufgaben gelöst")
+        if st.button("Lösung mit Kreuzvalidierung", type="primary"):
+            if not ocr_text:
+                st.error("❌ Kein OCR-Text verfügbar. Bitte überprüfe das Bild.")
             else:
-                st.error("❌ Keine Aufgaben gefunden")
-            
-            # Debug Details
-            if debug_mode:
-                col1, col2 = st.columns(2)
-                with col1:
-                    with st.expander("Claude Vollständige Lösung"):
-                        st.code(claude_full)
-                with col2:
-                    with st.expander("GPT Vollständige Lösung"):
-                        st.code(gpt_full if gpt_full else "Keine Lösung")
-                        
+                consensus, result = cross_validation_consensus(ocr_text)
+                
+                st.markdown("---")
+                st.markdown("###FINALE LÖSUNG:")
+                
+                if result is None:
+                    st.error("❌ Keine Lösung generiert. Überprüfe den OCR-Text oder Logs.")
+                elif not result:
+                    st.error("❌ Keine Aufgaben erkannt. Überprüfe, ob der OCR-Text 'Aufgabe X: ...' enthält.")
+                else:
+                    for task, data in result.items():
+                        st.markdown(f"### {task}: **{data['answer']}**")
+                        if data['reasoning']:
+                            st.markdown(f"*Begründung: {data['reasoning']}*")
+                        st.markdown("")
+                
+                if consensus is not None:
+                    if consensus:
+                        st.success("✅ Lösung durch Kreuzvalidierung bestätigt!")
+                    else:
+                        st.warning("⚠️ GPT-Kontrolle zeigte Diskrepanzen – Claude-Lösung bevorzugt.")
+                
+                st.info("OCR gecacht | Claude Opus 4 priorisiert | Robuste Antwortextraktion | GPT Fallback")
+                    
     except Exception as e:
         logger.error(f"Error: {str(e)}")
         st.error(f"❌ Fehler: {str(e)}")
 
-# Footer
 st.markdown("---")
-st.caption("🦊 Koifox-Bot | Optimierte Fusion | Gemini Flash 1.5 + Claude Opus 4 + GPT-4 Turbo")
+st.caption(f"🦊 Made by Fox & lots of love from Koi ❤️| Gemini Flash 1.5 | Claude-4 Opus | GPT-4 turbo")
