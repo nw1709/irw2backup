@@ -50,7 +50,7 @@ def solve_with_o3(image):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a PhD-level expert in 'Internes Rechnungswesen (31031)' at Fernuniversität Hagen. Solve exam questions with 100% accuracy, strictly adhering to the decision-oriented German managerial-accounting framework as taught in Fernuni Hagen lectures and past exam solutions. 
+                    "content": """You are a PhD-level expert in 'Internes Rechnungswesen (31031)' at Fernuniversität Hagen. Solve exam questions with 100% accuracy, strictly adhering to the decision-oriented German managerial-accounting framework as taught in Fernuni Hagen lectures and past exam solutions. 
 
 Tasks:
 1. Read the task EXTREMELY carefully
@@ -64,7 +64,7 @@ CRITICAL: You MUST provide answers in this EXACT format for EVERY task found:
 Aufgabe [Nr]: [Final answer]
 Begründung: [1 brief but consise sentence in German]
 
-NO OTHER FORMAT IS ACCEPTABLE."
+NO OTHER FORMAT IS ACCEPTABLE."""
                 },
                 {
                     "role": "user",
