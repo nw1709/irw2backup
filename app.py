@@ -2,7 +2,7 @@ import streamlit as st
 from openai import OpenAI, OpenAIError
 from PIL import Image
 import logging
-import hashlib
+import io
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -31,23 +31,26 @@ validate_keys()
 # --- UI-Einstellungen ---
 st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
 st.title("🦊 Koifox-Bot")
+st.markdown("*Hi der Kai ❤️*")
 
 # --- API Client ---
 openai_client = OpenAI(api_key=st.secrets["openai_key"])
 
-# --- OCR manuelle Eingabe ---
-def extract_text_manually():
-    ocr_text = st.text_area("**Kopiere den OCR-Text oder Aufgabentext hier ein...**", height=200)
-    if not ocr_text.strip():
-        st.error("Bitte füge den Aufgabentext ein!")
-        st.stop()
-    return ocr_text
+# --- OpenAI o3 Solver mit Bildverarbeitung ---
+def solve_with_o3(image):
+    try:
+        logger.info("Sending image to OpenAI o3 for processing")
+        # Konvertiere Bild in Bytes für die API
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format=image.format)
+        img_byte_arr = img_byte_arr.getvalue()
 
-# --- PRÄZISER PROMPT ---
-def create_precise_prompt(ocr_text, tasks):
-    task_str = tasks[0] if len(tasks) == 1 else f"{', '.join(tasks[:-1])} und {tasks[-1]}"
-    
-    return f"""You are a PhD-level expert in 'Internes Rechnungswesen (31031)' at Fernuniversität Hagen. Solve exam questions with 100% accuracy, strictly adhering to the decision-oriented German managerial-accounting framework as taught in Fernuni Hagen lectures and past exam solutions. 
+        response = openai_client.chat.completions.create(
+            model="o3",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a PhD-level expert in 'Internes Rechnungswesen (31031)' at Fernuniversität Hagen. Solve exam questions with 100% accuracy, strictly adhering to the decision-oriented German managerial-accounting framework as taught in Fernuni Hagen lectures and past exam solutions. 
 
 Tasks:
 1. Read the task EXTREMELY carefully
@@ -61,43 +64,15 @@ CRITICAL: You MUST provide answers in this EXACT format for EVERY task found:
 Aufgabe [Nr]: [Final answer]
 Begründung: [1 brief but consise sentence in German]
 
-NO OTHER FORMAT IS ACCEPTABLE. 
-
-AUFGABENTEXT:
-{ocr_text}"""
-
-# --- Aufgaben-Extraktion ---
-def extract_tasks_from_ocr(ocr_text):
-    import re
-    task_patterns = [
-        r'Aufgabe\s+(\d+)', r'Task\s+(\d+)', r'Frage\s+(\d+)', r'Question\s+(\d+)',
-        r'Problem\s+(\d+)', r'Exercise\s+(\d+)', r'Übung\s+(\d+)',
-        r'^(\d+)\s*[.:)]\s*(?:Aufgabe|Task|Frage)'
-    ]
-    tasks = set()
-    lines = ocr_text.split('\n')
-    for line in lines:
-        line = line.strip()
-        for pattern in task_patterns:
-            match = re.search(pattern, line, re.IGNORECASE)
-            if match:
-                tasks.add(match.group(1))
-    task_numbers = sorted([int(t) for t in tasks])
-    task_strings = [str(t) for t in task_numbers]
-    logger.info(f"Found actual tasks in OCR: {task_strings}")
-    return task_strings
-
-# --- OpenAI o3 Solver ---
-def solve_with_o3(ocr_text, tasks):
-    prompt = create_precise_prompt(ocr_text, tasks)
-    
-    try:
-        logger.info(f"Sending request to OpenAI o3 with tasks: {', '.join(tasks)}")
-        response = openai_client.chat.completions.create(
-            model="o3",
-            messages=[
-                {"role": "system", "content": "Du bist ein Experte für Internes Rechnungswesen."},
-                {"role": "user", "content": prompt}
+NO OTHER FORMAT IS ACCEPTABLE."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Extract all text from the provided exam image EXACTLY as written, including every detail from graphs, charts, or sketches. For graphs: Explicitly list ALL axis labels, ALL scales, ALL intersection points with axes (e.g., 'x-axis at 450', 'y-axis at 20'), and EVERY numerical value or annotation. Then, solve ONLY the tasks identified (e.g., Aufgabe 1). Use the following format: Aufgabe [number]: [Your answer here] Begründung: [Short explanation]. Do NOT mention or solve other tasks!"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_byte_arr}"}}  # Annahme: JPEG, anpassen bei Bedarf
+                    ]
+                }
             ],
             max_completion_tokens=4000
         )
@@ -115,43 +90,29 @@ def solve_with_o3(ocr_text, tasks):
 # --- HAUPTINTERFACE ---
 debug_mode = st.checkbox("🔍 Debug-Modus", value=False)
 
-uploaded_file = st.file_uploader("**Klausuraufgabe hochladen...** (optional)", type=["png", "jpg", "jpeg"])
+uploaded_file = st.file_uploader("**Klausuraufgabe hochladen...**", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
     try:
-        file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest()
         image = Image.open(uploaded_file)
-        st.image(image, caption="Hochgeladene Klausuraufgabe", use_container_width=True)
-        with st.spinner("Lese Text manuell (kopiere den Text bitte)..."):
-            st.warning("Automatisches OCR wurde entfernt. Kopiere den Text aus dem Bild und füge ihn unten ein.")
+        st.image(image, caption="Hochgeladene Klausuraufgabe", use_column_width=True)
+        
+        if st.button("Aufgabe(n) lösen", type="primary"):
+            st.markdown("---")
+            with st.spinner("OpenAI o3 analysiert..."):
+                o3_solution = solve_with_o3(image)
+            
+            if o3_solution:
+                st.markdown("### FINALE LÖSUNG")
+                st.markdown(o3_solution)
+                if debug_mode:
+                    with st.expander("🔍 o3 Rohausgabe"):
+                        st.code(o3_solution)
+            else:
+                st.error("❌ Keine Lösung generiert")
     except Exception as e:
         logger.error(f"Error loading image: {str(e)}")
-        st.error(f"Fehler beim Laden des Bildes: {str(e)}")
-
-# Manuelle Textverarbeitung
-ocr_text = extract_text_manually()
-tasks = extract_tasks_from_ocr(ocr_text)
-
-if tasks:
-    st.success(f"Gefunden: Aufgabe {', '.join(tasks)}")
-    
-    if debug_mode:
-        with st.expander("🔍 Eingabe-Text"):
-            st.code(ocr_text)
-    
-    if st.button("Aufgabe(n) lösen", type="primary"):
-        st.markdown("---")
-        with st.spinner("OpenAI o3 analysiert..."):
-            o3_solution = solve_with_o3(ocr_text, tasks)
-        
-        if o3_solution:
-            st.markdown("### FINALE LÖSUNG")
-            st.markdown(o3_solution)
-            if debug_mode:
-                with st.expander("🔍 o3 Rohausgabe"):
-                    st.code(o3_solution)
-        else:
-            st.error("❌ Keine Lösung generiert")
+        st.error(f"❌ Fehler beim Laden des Bildes: {str(e)}")
 
 # Footer
 st.markdown("---")
