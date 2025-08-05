@@ -227,7 +227,7 @@ def solve_with_o3(ocr_text, tasks):
                 },
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=4000,
+            max_completion_tokens=4000,  # Geändert von max_tokens zu max_completion_tokens
             temperature=0.1
         )
         
