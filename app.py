@@ -1,5 +1,4 @@
 import streamlit as st
-from anthropic import Anthropic
 from openai import OpenAI
 from PIL import Image
 import google.generativeai as genai
@@ -15,7 +14,6 @@ logger = logging.getLogger(__name__)
 def validate_keys():
     required_keys = {
         'gemini_key': ('AIza', "Gemini"),
-        'claude_key': ('sk-ant', "Claude"),
         'openai_key': ('sk-', "OpenAI")
     }
     missing = []
@@ -41,7 +39,6 @@ st.markdown("*Hi der Kai ❤️*")
 # --- API Clients ---
 genai.configure(api_key=st.secrets["gemini_key"])
 vision_model = genai.GenerativeModel("gemini-1.5-flash")
-claude_client = Anthropic(api_key=st.secrets["claude_key"])
 openai_client = OpenAI(api_key=st.secrets["openai_key"])
 
 # --- OCR mit Caching ---
@@ -208,35 +205,13 @@ AUSGABEFORMAT - EXAKT SO:
 Aufgabe {tasks[0]}: [Deine Antwort hier]
 Begründung: [Kurze Erklärung]
 
-{f'Aufgabe {tasks[1]}: [Deine Antwort hier]' if len(tasks) > 1 else ''}
+{f'Aufgabe {tasks[1]}: [Deine Antwort here]' if len(tasks) > 1 else ''}
 {f'Begründung: [Kurze Erklärung]' if len(tasks) > 1 else ''}
 
 KEINE ANDEREN AUFGABEN ERWÄHNEN ODER LÖSEN!"""
 
-# --- Claude Solver (vereinfacht) ---
-def solve_with_claude(ocr_text, tasks):
-    if not tasks:
-        return ""
-        
-    prompt = create_precise_prompt(ocr_text, tasks)
-    
-    try:
-        response = claude_client.messages.create(
-            model="claude-4-1-opus",
-            max_tokens=8000,
-            temperature=0.1,
-            system=f"Löse NUR Aufgabe(n) {', '.join(tasks)}. Keine anderen Nummern erwähnen!",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        return response.content[0].text
-        
-    except Exception as e:
-        logger.error(f"Claude Error: {str(e)}")
-        raise e
-
-# --- GPT Solver (vereinfacht) ---
-def solve_with_gpt(ocr_text, tasks):
+# --- OpenAI o3 Solver ---
+def solve_with_o3(ocr_text, tasks):
     if not tasks:
         return ""
         
@@ -259,7 +234,7 @@ def solve_with_gpt(ocr_text, tasks):
         return response.choices[0].message.content
         
     except Exception as e:
-        logger.error(f"GPT Error: {str(e)}")
+        logger.error(f"o3 Error: {str(e)}")
         return None
 
 # --- Antwortvergleich ---
@@ -289,50 +264,40 @@ def cross_validation(ocr_text, tasks):
     """Einfache, robuste Kreuzvalidierung"""
     st.markdown("### 🔄 Kreuzvalidierung")
     
-    # Claude
-    with st.spinner("Claude Opus 4 analysiert..."):
-        claude_solution = solve_with_claude(ocr_text, tasks)
-    claude_data = extract_structured_answers(claude_solution, tasks)
+    # o3
+    with st.spinner("OpenAI o3 analysiert..."):
+        o3_solution = solve_with_o3(ocr_text, tasks)
+    o3_data = extract_structured_answers(o3_solution, tasks)
     
-    # GPT
-    with st.spinner("GPT-o3 validiert..."):
-        gpt_solution = solve_with_gpt(ocr_text, tasks)
-        gpt_data = extract_structured_answers(gpt_solution, tasks) if gpt_solution else {}
+    # Platzhalter für GPT (nicht verwendet)
+    gpt_solution = ""
+    gpt_data = {}
     
     # Ergebnisse zusammenführen
     final_answers = {}
     
     for task in tasks:
         task_key = f"Aufgabe {task}"
-        claude_ans = claude_data.get(task_key, {}).get('answer', '')
-        gpt_ans = gpt_data.get(task_key, {}).get('answer', '')
+        o3_ans = o3_data.get(task_key, {}).get('answer', '')
         
         col1, col2, col3, col4 = st.columns([2, 3, 3, 1])
         with col1:
             st.write(f"**Aufgabe {task}:**")
         with col2:
-            st.write(f"Claude: `{claude_ans}`" if claude_ans else "Claude: -")
+            st.write(f"o3: `{o3_ans}`" if o3_ans else "o3: -")
         with col3:
-            st.write(f"GPT: `{gpt_ans}`" if gpt_ans else "GPT: -")
+            st.write("GPT: -")  # Kein GPT mehr
         
-        # Claude hat Priorität
-        if claude_ans:
-            final_answers[task_key] = claude_data[task_key]
-            if gpt_ans and answers_are_equivalent(claude_ans, gpt_ans):
-                with col4:
-                    st.write("✅")
-            else:
-                with col4:
-                    st.write("⚠️")
-        elif gpt_ans:
-            final_answers[task_key] = gpt_data[task_key]
+        # o3 hat Priorität
+        if o3_ans:
+            final_answers[task_key] = o3_data[task_key]
             with col4:
-                st.write("🔄")
+                st.write("✅")
         else:
             with col4:
                 st.write("❌")
     
-    return final_answers, claude_solution, gpt_solution
+    return final_answers, o3_solution, gpt_solution
 
 # --- HAUPTINTERFACE ---
 debug_mode = st.checkbox("🔍 Debug-Modus", value=False)
@@ -379,7 +344,7 @@ if uploaded_file is not None:
             st.markdown("---")
             
             # Kreuzvalidierung
-            final_answers, claude_full, gpt_full = cross_validation(ocr_text, tasks)
+            final_answers, o3_full, gpt_full = cross_validation(ocr_text, tasks)
             
             # Finale Ausgabe
             st.markdown("---")
@@ -402,8 +367,8 @@ if uploaded_file is not None:
             if debug_mode:
                 col1, col2 = st.columns(2)
                 with col1:
-                    with st.expander("Claude Rohausgabe"):
-                        st.code(claude_full)
+                    with st.expander("o3 Rohausgabe"):
+                        st.code(o3_full)
                 with col2:
                     with st.expander("GPT Rohausgabe"):
                         st.code(gpt_full if gpt_full else "Keine Lösung")
@@ -414,4 +379,4 @@ if uploaded_file is not None:
 
 # Footer
 st.markdown("---")
-st.caption("Made by Fox & Koi-9 ❤️ | Gemini Flash 1.5 | Claude Opus 4 | GPT-o3")
+st.caption("Made by Fox & Koi-9 ❤️ | Gemini Flash 1.5 | OpenAI o3")
