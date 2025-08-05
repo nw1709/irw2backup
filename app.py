@@ -222,7 +222,7 @@ def solve_with_claude(ocr_text, tasks):
     
     try:
         response = claude_client.messages.create(
-            model="claude-4-opus-20250514",
+            model="claude-4-1-opus-20250805",
             max_tokens=8000,
             temperature=0.1,
             system=f"Löse NUR Aufgabe(n) {', '.join(tasks)}. Keine anderen Nummern erwähnen!",
