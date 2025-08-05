@@ -64,7 +64,7 @@ Begründung: [1 brief but consise sentence in German]
 NO OTHER FORMAT IS ACCEPTABLE. 
 
 AUFGABENTEXT:
-{ocr_text}
+{ocr_text}"""
 
 # --- Aufgaben-Extraktion ---
 def extract_tasks_from_ocr(ocr_text):
