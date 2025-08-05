@@ -3,6 +3,8 @@ from openai import OpenAI, OpenAIError
 from PIL import Image
 import logging
 import io
+import pdf2image
+import os
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -28,13 +30,36 @@ def validate_keys():
 
 validate_keys()
 
-# --- UI-Einstellungen ---
-st.set_page_config(layout="centered", page_title="Koifox-Bot", page_icon="🦊")
-st.title("🦊 Koifox-Bot")
-st.markdown("*Hi der Kai ❤️*")
-
 # --- API Client ---
 openai_client = OpenAI(api_key=st.secrets["openai_key"])
+
+# --- Datei in Bild konvertieren ---
+def convert_to_image(uploaded_file):
+    try:
+        # Ermittle Dateityp
+        file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+        
+        if file_extension in ['.png', '.jpeg', '.jpg', '.gif', '.webp']:
+            # Direkte Bildformate
+            image = Image.open(uploaded_file).convert('RGB')
+            return image
+        
+        elif file_extension == '.pdf':
+            # PDF in Bilder konvertieren
+            images = pdf2image.convert_from_bytes(uploaded_file.getvalue())
+            if images:
+                return images[0]  # Nimm die erste Seite
+            else:
+                raise ValueError("PDF konnte nicht konvertiert werden.")
+        
+        else:
+            st.error(f"❌ Nicht unterstütztes Format: {file_extension}. Bitte lade PNG, JPEG, GIF, WebP oder PDF hoch.")
+            st.stop()
+            
+    except Exception as e:
+        logger.error(f"Error converting file to image: {str(e)}")
+        st.error(f"❌ Fehler bei der Konvertierung: {str(e)}")
+        return None
 
 # --- OpenAI o3 Solver mit Bildverarbeitung ---
 def solve_with_o3(image):
@@ -42,7 +67,7 @@ def solve_with_o3(image):
         logger.info("Sending image to OpenAI o3 for processing")
         # Konvertiere Bild in Bytes für die API
         img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format=image.format)
+        image.save(img_byte_arr, format='JPEG')  # Immer als JPEG speichern
         img_byte_arr = img_byte_arr.getvalue()
 
         response = openai_client.chat.completions.create(
@@ -50,7 +75,7 @@ def solve_with_o3(image):
             messages=[
                 {
                     "role": "system",
-                    "content": """You are a PhD-level expert in 'Internes Rechnungswesen (31031)' at Fernuniversität Hagen. Solve exam questions with 100% accuracy, strictly adhering to the decision-oriented German managerial-accounting framework as taught in Fernuni Hagen lectures and past exam solutions. 
+                    "content": "You are a PhD-level expert in 'Internes Rechnungswesen (31031)' at Fernuniversität Hagen. Solve exam questions with 100% accuracy, strictly adhering to the decision-oriented German managerial-accounting framework as taught in Fernuni Hagen lectures and past exam solutions. 
 
 Tasks:
 1. Read the task EXTREMELY carefully
@@ -64,13 +89,13 @@ CRITICAL: You MUST provide answers in this EXACT format for EVERY task found:
 Aufgabe [Nr]: [Final answer]
 Begründung: [1 brief but consise sentence in German]
 
-NO OTHER FORMAT IS ACCEPTABLE."""
+NO OTHER FORMAT IS ACCEPTABLE."
                 },
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Extract all text from the provided exam image EXACTLY as written, including every detail from graphs, charts, or sketches. For graphs: Explicitly list ALL axis labels, ALL scales, ALL intersection points with axes (e.g., 'x-axis at 450', 'y-axis at 20'), and EVERY numerical value or annotation. Then, solve ONLY the tasks identified (e.g., Aufgabe 1). Use the following format: Aufgabe [number]: [Your answer here] Begründung: [Short explanation]. Do NOT mention or solve other tasks!"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_byte_arr}"}}  # Annahme: JPEG, anpassen bei Bedarf
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_byte_arr}"}}
                     ]
                 }
             ],
@@ -90,29 +115,30 @@ NO OTHER FORMAT IS ACCEPTABLE."""
 # --- HAUPTINTERFACE ---
 debug_mode = st.checkbox("🔍 Debug-Modus", value=False)
 
-uploaded_file = st.file_uploader("**Klausuraufgabe hochladen...**", type=["png", "jpg", "jpeg"])
+uploaded_file = st.file_uploader("**Klausuraufgabe hochladen...**", type=["png", "jpg", "jpeg", "gif", "webp", "pdf"])
 
 if uploaded_file is not None:
     try:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Hochgeladene Klausuraufgabe", use_column_width=True)
-        
-        if st.button("Aufgabe(n) lösen", type="primary"):
-            st.markdown("---")
-            with st.spinner("OpenAI o3 analysiert..."):
-                o3_solution = solve_with_o3(image)
+        image = convert_to_image(uploaded_file)
+        if image:
+            st.image(image, caption="Verarbeitetes Bild", use_column_width=True)
             
-            if o3_solution:
-                st.markdown("### FINALE LÖSUNG")
-                st.markdown(o3_solution)
-                if debug_mode:
-                    with st.expander("🔍 o3 Rohausgabe"):
-                        st.code(o3_solution)
-            else:
-                st.error("❌ Keine Lösung generiert")
+            if st.button("🧮 Aufgabe(n) lösen", type="primary"):
+                st.markdown("---")
+                with st.spinner("OpenAI o3 analysiert..."):
+                    o3_solution = solve_with_o3(image)
+                
+                if o3_solution:
+                    st.markdown("### 🎯 FINALE LÖSUNG")
+                    st.markdown(o3_solution)
+                    if debug_mode:
+                        with st.expander("🔍 o3 Rohausgabe"):
+                            st.code(o3_solution)
+                else:
+                    st.error("❌ Keine Lösung generiert")
     except Exception as e:
-        logger.error(f"Error loading image: {str(e)}")
-        st.error(f"❌ Fehler beim Laden des Bildes: {str(e)}")
+        logger.error(f"Error processing file: {str(e)}")
+        st.error(f"❌ Fehler bei der Verarbeitung: {str(e)}")
 
 # Footer
 st.markdown("---")
