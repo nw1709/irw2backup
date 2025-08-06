@@ -5,6 +5,7 @@ import logging
 import io
 import pdf2image
 import os
+import base64
 
 # --- Logger Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -40,7 +41,9 @@ def convert_to_image(uploaded_file):
         logger.info(f"Processing file with extension: {file_extension}")
         
         if file_extension in ['.png', '.jpeg', '.jpg', '.gif', '.webp']:
-            image = Image.open(uploaded_file).convert('RGB')
+            image = Image.open(uploaded_file)
+            if not image.format:
+                image = image.convert('RGB')  # Zwangs-Konvertierung, falls Format nicht erkannt
             logger.info(f"Loaded image with format: {image.format}")
             return image
         
@@ -68,9 +71,13 @@ def solve_with_o3(image):
     try:
         logger.info("Preparing image for OpenAI o3")
         img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format='JPEG')  # Immer als JPEG speichern
+        image.save(img_byte_arr, format='JPEG', quality=85)  # Qualität anpassen
         img_bytes = img_byte_arr.getvalue()
-        logger.info(f"Image size in bytes: {len(img_bytes)} and format: JPEG")
+        logger.info(f"Image size in bytes: {len(img_bytes)}")
+
+        # Base64 kodieren und überprüfen
+        img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+        logger.info(f"Base64 encoded length: {len(img_base64)}")
 
         response = openai_client.chat.completions.create(
             model="o3",
@@ -91,13 +98,13 @@ CRITICAL: You MUST provide answers in this EXACT format for EVERY task found:
 Aufgabe [Nr]: [Final answer]
 Begründung: [1 brief but consise sentence in German]
 
-NO OTHER FORMAT IS ACCEPTABLE."""
+NO OTHER FORMAT IS ACCEPTABLE. """
                 },
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Extract all text from the provided exam image EXACTLY as written, including every detail from graphs, charts, or sketches. For graphs: Explicitly list ALL axis labels, ALL scales, ALL intersection points with axes (e.g., 'x-axis at 450', 'y-axis at 20'), and EVERY numerical value or annotation. Then, solve ONLY the tasks identified (e.g., Aufgabe 1). Use the following format: Aufgabe [number]: [Your answer here] Begründung: [Short explanation]. Do NOT mention or solve other tasks!"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_bytes}"}}
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}}
                     ]
                 }
             ],
@@ -123,7 +130,7 @@ if uploaded_file is not None:
     try:
         image = convert_to_image(uploaded_file)
         if image:
-            st.image(image, caption="Verarbeitetes Bild", use_column_width=True)
+            st.image(image, caption="Verarbeitetes Bild", use_container_width=True)  # Deprecation behoben
             logger.info(f"Image format after conversion: {image.format}")
             
             if st.button("🧮 Aufgabe(n) lösen", type="primary"):
