@@ -47,15 +47,6 @@ def convert_to_image(uploaded_file):
             logger.info(f"Loaded image with format: {image.format}")
             return image
         
-        elif file_extension == '.pdf':
-            logger.info("Converting PDF to image")
-            images = pdf2image.convert_from_bytes(uploaded_file.getvalue())
-            if images:
-                image = images[0].convert('RGB')
-                logger.info("PDF conversion successful")
-                return image
-            else:
-                raise ValueError("PDF konnte nicht konvertiert werden.")
         
         else:
             st.error(f"❌ Nicht unterstütztes Format: {file_extension}. Bitte lade PNG, JPEG, GIF, WebP oder PDF hoch.")
