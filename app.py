@@ -36,19 +36,21 @@ openai_client = OpenAI(api_key=st.secrets["openai_key"])
 # --- Datei in Bild konvertieren ---
 def convert_to_image(uploaded_file):
     try:
-        # Ermittle Dateityp
         file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+        logger.info(f"Processing file with extension: {file_extension}")
         
         if file_extension in ['.png', '.jpeg', '.jpg', '.gif', '.webp']:
-            # Direkte Bildformate
             image = Image.open(uploaded_file).convert('RGB')
+            logger.info(f"Loaded image with format: {image.format}")
             return image
         
         elif file_extension == '.pdf':
-            # PDF in Bilder konvertieren
+            logger.info("Converting PDF to image")
             images = pdf2image.convert_from_bytes(uploaded_file.getvalue())
             if images:
-                return images[0]  # Nimm die erste Seite
+                image = images[0].convert('RGB')
+                logger.info("PDF conversion successful")
+                return image
             else:
                 raise ValueError("PDF konnte nicht konvertiert werden.")
         
@@ -64,11 +66,11 @@ def convert_to_image(uploaded_file):
 # --- OpenAI o3 Solver mit Bildverarbeitung ---
 def solve_with_o3(image):
     try:
-        logger.info("Sending image to OpenAI o3 for processing")
-        # Konvertiere Bild in Bytes für die API
+        logger.info("Preparing image for OpenAI o3")
         img_byte_arr = io.BytesIO()
         image.save(img_byte_arr, format='JPEG')  # Immer als JPEG speichern
-        img_byte_arr = img_byte_arr.getvalue()
+        img_bytes = img_byte_arr.getvalue()
+        logger.info(f"Image size in bytes: {len(img_bytes)} and format: JPEG")
 
         response = openai_client.chat.completions.create(
             model="o3",
@@ -95,7 +97,7 @@ NO OTHER FORMAT IS ACCEPTABLE."""
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Extract all text from the provided exam image EXACTLY as written, including every detail from graphs, charts, or sketches. For graphs: Explicitly list ALL axis labels, ALL scales, ALL intersection points with axes (e.g., 'x-axis at 450', 'y-axis at 20'), and EVERY numerical value or annotation. Then, solve ONLY the tasks identified (e.g., Aufgabe 1). Use the following format: Aufgabe [number]: [Your answer here] Begründung: [Short explanation]. Do NOT mention or solve other tasks!"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_byte_arr}"}}
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_bytes}"}}
                     ]
                 }
             ],
@@ -122,6 +124,7 @@ if uploaded_file is not None:
         image = convert_to_image(uploaded_file)
         if image:
             st.image(image, caption="Verarbeitetes Bild", use_column_width=True)
+            logger.info(f"Image format after conversion: {image.format}")
             
             if st.button("🧮 Aufgabe(n) lösen", type="primary"):
                 st.markdown("---")
