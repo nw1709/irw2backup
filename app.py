@@ -23,7 +23,7 @@ st.markdown(f'''
 st.set_page_config(layout="centered", page_title="KFB2", page_icon="🦊")
 
 st.title("🦊 Koifox-Bot 2 ")
-st.write("made with love, deep minimal and powered by fox & koi9 🚀")
+st.write("made with deep minimal § love by fox 🚀")
 
 
 # --- Logger Setup ---
