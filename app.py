@@ -8,22 +8,22 @@ import os
 import base64
 
 # Meta-Tags und Icon für iOS Homescreen Shortcut
-icon_url = "https://em-content.zobj.net/thumbs/120/apple/325/fox-face_1f98a.png"
-
 st.markdown(f'''
 <!-- Apple Touch Icon -->
-<link rel="apple-touch-icon" sizes="180x180" href="{icon_url}">
+<link rel="apple-touch-icon" sizes="180x180" href="https://em-content.zobj.net/thumbs/120/apple/325/fox-face_1f98a.png">
 
 <!-- Web App Meta Tags -->
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="theme-color" content="#FF6600">  <!-- Orange passend zum Fuchs -->
+<meta name="theme-color" content="#FF6600"> 
 
 <!-- Optional: Splashscreen (kann später ergänzt werden) -->
 ''', unsafe_allow_html=True)
 
-st.title("Koifox-Bot 2 ")
-st.write("made with love, deep minimal and powered by fox & koi9 🚀✨❤️")
+st.set_page_config(layout="centered", page_title="KFB2", page_icon="🦊")
+
+st.title("🦊 Koifox-Bot 2 ")
+st.write("made with love, deep minimal and powered by fox & koi9 🚀")
 
 
 # --- Logger Setup ---
