@@ -23,7 +23,7 @@ st.markdown(f'''
 st.set_page_config(layout="centered", page_title="KFB2", page_icon="🦊")
 
 st.title("🦊 Koifox-Bot 2 ")
-st.write("made with deep minimal § love by fox 🚀")
+st.write("made with deep minimal & love by fox 🚀")
 
 
 # --- Logger Setup ---
@@ -140,14 +140,26 @@ if uploaded_file is not None:
     try:
         image = convert_to_image(uploaded_file)
         if image:
-            st.image(image, caption="Verarbeitetes Bild", use_container_width=True)  # Deprecation behoben
-            logger.info(f"Image format after conversion: {image.format}")
-            
+            # Rotation-Status im Session State initialisieren
+            if "rotation" not in st.session_state:
+                st.session_state.rotation = 0
+
+            # Button zum Drehen
+            if st.button("Bild drehen"):
+                st.session_state.rotation = (st.session_state.rotation + 90) % 360
+
+            # Bild drehen (PIL dreht gegen den Uhrzeigersinn, daher minus)
+            rotated_img = image.rotate(-st.session_state.rotation, expand=True)
+
+            # Vorschau anzeigen
+            st.image(rotated_img, caption=f"Verarbeitetes Bild (gedreht um {st.session_state.rotation}°)", use_container_width=True)
+
+            # Button zum Lösen mit gedrehtem Bild
             if st.button("🧮 Aufgabe(n) lösen", type="primary"):
                 st.markdown("---")
                 with st.spinner("OpenAI o3 analysiert..."):
-                    o3_solution = solve_with_o3(image)
-                
+                    o3_solution = solve_with_o3(rotated_img)
+
                 if o3_solution:
                     st.markdown("### 🎯 FINALE LÖSUNG")
                     st.markdown(o3_solution)
